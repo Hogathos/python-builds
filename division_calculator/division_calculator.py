@@ -96,4 +96,4 @@ while True:
         print(f"Line artillery soft attack: {artillery_soft_attack}")
         print(f"Base artillery equipment defense: {line_equipment_defense}")
         print(f"Calculated soft attack: {total_soft_attack}")
-    print(f"Average organisation: {average_org}")
+    print(f"Average organisation: {average_org:.2f}")
