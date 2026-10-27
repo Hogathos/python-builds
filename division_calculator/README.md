@@ -17,7 +17,17 @@ When prompted, enter the number of infantry battalions, choose `support` or
 `line` artillery, then enter the number of artillery battalions. For example,
 enter `9`, `support`, and `1` for nine infantry battalions and one support-
 artillery company. Choose `line` to calculate line artillery battalions
-instead.
+instead. After each report, the program starts another calculation. Enter
+`exit` at the infantry prompt to quit.
+
+## How the repeat loop works
+
+The `while True:` statement starts a loop that keeps running until the program
+is told to stop. The calculator prompts and calculations are indented under
+that statement, so they run again after each report. At the first prompt,
+`exit` is checked before the text is converted to an integer; if it matches,
+`SystemExit` ends the program. The calculation is still written directly in
+the loop for this version; it has not been moved into a function.
 
 ## What it calculates
 
