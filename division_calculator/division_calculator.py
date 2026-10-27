@@ -12,16 +12,40 @@ inf_soft_attack = 25.5   # per battalion (equipment 3 x 8.5, verified in designe
 inf_org = 60             # organisation — averaged across battalions, not summed
 
 # --- Support artillery (common/units/artillery.txt + equipment/artillery.txt) ---
-art_manpower = 300          # men per battalion
-art_width = 0               # combat width per battalion
-art_equipment = 12          # artillery equipment needed per battalion
-art_soft_attack_modifier = -0.5  # support-battalion modifier in artillery.txt
-art_equipment_soft_attack = 26   # base artillery equipment (1934 tier)
-art_equipment_defense = 11       # base artillery equipment (1934 tier)
-art_org = 0                      # max organisation
+support_manpower = 300
+support_width = 0
+support_equipment = 12
+support_soft_attack_modifier = -0.5
+support_equipment_soft_attack = 26  # base artillery equipment (1934 tier)
+support_equipment_defense = 11      # base artillery equipment (1934 tier)
+support_org = 0
+
+# --- Line artillery (common/units/artillery_brigade.txt + equipment/artillery.txt) ---
+line_manpower = 500
+line_width = 3
+line_equipment = 24
+line_soft_attack = 26  # base artillery equipment soft attack (1934 tier)
+line_equipment_defense = 11
+line_org = 0
 
 inf_battalions = int(input("Infantry battalions: "))
-art_battalions = int(input("Support artillery battalions: "))
+artillery_type = input("Artillery type (support or line): ").lower()
+
+if artillery_type == "support":
+    art_manpower = support_manpower
+    art_width = support_width
+    art_equipment = support_equipment
+    art_org = support_org
+elif artillery_type == "line":
+    art_manpower = line_manpower
+    art_width = line_width
+    art_equipment = line_equipment
+    art_org = line_org
+else:
+    print("Please enter 'support' or 'line'.")
+    raise SystemExit(1)
+
+art_battalions = int(input(f"{artillery_type.title()} artillery battalions: "))
 
 total_manpower = (
     inf_battalions * inf_manpower
@@ -36,6 +60,10 @@ total_equipment = (
     + art_battalions * art_equipment
 )
 infantry_soft_attack = inf_battalions * inf_soft_attack
+artillery_soft_attack = 0
+if artillery_type == "line":
+    artillery_soft_attack = art_battalions * line_soft_attack
+total_soft_attack = infantry_soft_attack + artillery_soft_attack
 total_battalions = inf_battalions + art_battalions
 
 if total_battalions > 0:
@@ -53,7 +81,12 @@ print(f"Infantry equipment: {inf_battalions * inf_equipment}")
 print(f"Artillery equipment: {art_battalions * art_equipment}")
 print(f"Total equipment: {total_equipment}")
 print(f"Infantry soft attack: {infantry_soft_attack}")
-print(f"Artillery support soft-attack modifier: {art_soft_attack_modifier}")
-print(f"Base artillery equipment soft attack: {art_equipment_soft_attack}")
-print(f"Base artillery equipment defense: {art_equipment_defense}")
+if artillery_type == "support":
+    print(f"Support soft-attack modifier: {support_soft_attack_modifier}")
+    print(f"Base artillery equipment soft attack: {support_equipment_soft_attack}")
+    print(f"Base artillery equipment defense: {support_equipment_defense}")
+else:
+    print(f"Line artillery soft attack: {artillery_soft_attack}")
+    print(f"Base artillery equipment defense: {line_equipment_defense}")
+    print(f"Calculated soft attack: {total_soft_attack}")
 print(f"Average organisation: {average_org}")
