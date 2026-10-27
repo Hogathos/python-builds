@@ -5,3 +5,4 @@ My Python build projects, collected while working through freeCodeCamp's Scienti
 ## Builds
 - [movie-ticket-calculator](movie-ticket-calculator/) — movie night budget calculator (booleans, conditionals, f-strings)
 - [grade-calculator](grade-calculator/) — letter grades from numeric scores (elif chains, f-strings)
+- [division_calculator](division_calculator/) — HOI4 division stats calculator (infantry + support artillery, verified against the in-game designer)
