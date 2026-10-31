@@ -29,6 +29,34 @@ line_equipment_defense = 11
 line_org = 0
 
 
+def print_report(total_manpower,
+                  total_width,
+                  inf_battalions, inf_equipment,
+                  art_battalions, art_equipment,
+                  total_equipment,
+                  infantry_soft_attack,
+                  artillery_type,
+                  artillery_soft_attack,
+                  total_soft_attack,
+                  average_org):
+    print("\nDivision report")
+    print(f"Manpower: {total_manpower}")
+    print(f"Combat width: {total_width}")
+    print(f"Infantry equipment: {inf_battalions * inf_equipment}")
+    print(f"Artillery equipment: {art_battalions * art_equipment}")
+    print(f"Total equipment: {total_equipment}")
+    print(f"Infantry soft attack: {infantry_soft_attack}")
+    if artillery_type == "support":
+        print(f"Support soft-attack modifier: {support_soft_attack_modifier}")
+        print(f"Base artillery equipment soft attack: {support_equipment_soft_attack}")
+        print(f"Base artillery equipment defense: {support_equipment_defense}")
+    else:
+        print(f"Line artillery soft attack: {artillery_soft_attack}")
+        print(f"Base artillery equipment defense: {line_equipment_defense}")
+    print(f"Calculated soft attack: {total_soft_attack}")
+    print(f"Average organisation: {average_org:.2f}")
+
+
 def calculate_division():
     while True:
         infantry_input = input(
@@ -83,20 +111,13 @@ def calculate_division():
         else:
             average_org = 0
 
-        print("\nDivision report")
-        print(f"Manpower: {total_manpower}")
-        print(f"Combat width: {total_width}")
-        print(f"Infantry equipment: {inf_battalions * inf_equipment}")
-        print(f"Artillery equipment: {art_battalions * art_equipment}")
-        print(f"Total equipment: {total_equipment}")
-        print(f"Infantry soft attack: {infantry_soft_attack}")
-        if artillery_type == "support":
-            print(f"Support soft-attack modifier: {support_soft_attack_modifier}")
-            print(f"Base artillery equipment soft attack: {support_equipment_soft_attack}")
-            print(f"Base artillery equipment defense: {support_equipment_defense}")
-        else:
-         print(f"Line artillery soft attack: {artillery_soft_attack}")
-         print(f"Base artillery equipment defense: {line_equipment_defense}")
-         print(f"Calculated soft attack: {total_soft_attack}")
-         print(f"Average organisation: {average_org:.2f}")
+        print_report(total_manpower, total_width,
+                     inf_battalions, inf_equipment,
+                     art_battalions, art_equipment,
+                     total_equipment,
+                     infantry_soft_attack,
+                     artillery_type,
+                     artillery_soft_attack,
+                     total_soft_attack,
+                     average_org)
 calculate_division()
