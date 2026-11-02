@@ -3,7 +3,7 @@
 Local proxy in the middle of agent traffic, so the log is real traffic.
 Built milestone by milestone from the 2026-11-01 proxy sketch.
 
-## Status: M3 (awaiting approval before M4)
+## Status: M4 (awaiting approval)
 
 M1 is a plain-HTTP forwarding proxy to a local test server with
 metadata-only SQLite logging. M2 adds CONNECT tunnelling: the proxy
@@ -23,8 +23,23 @@ Every attempt from both legs is logged under that one trace_id, with
 dest_host / endpoint distinguishing the A leg (Agent B's /task) from
 the B leg (upstream /echo). Run it with `python demo_two_agents.py`
 or the tests in `tests/test_trace_propagation.py`; Agent B standalone
-is `python agent_b.py --port 18081`. No allowlist / rate limit /
-block test (M4) yet.
+is `python agent_b.py --port 18081`.
+
+M4 adds the allowlist and rate limit. Only destinations on the
+configurable allowlist are forwarded (default local test hosts
+`127.0.0.1`, `localhost`, `::1`; change with `--allowlist` or
+`serve(..., allowlist=...)`). A non-allowlisted destination is
+blocked at the proxy and never forwarded: HTTP gets 403, a CONNECT
+tunnel is never opened, and the attempt is logged `outcome=blocked`,
+`reason=not_allowlisted`. More than the configured rate limit
+(`--rate-limit`, default 100 per `--rate-window` 10s, per
+destination) gets 429 and is logged `outcome=rate_limited`,
+`reason=rate_limited`; after the window passes, requests pass again.
+Forwarded attempts log `outcome=allowed`. The two new columns are
+the only logging change; M1/M2/M3 fields and trace propagation are
+unchanged. Run the demo with `python demo_m4.py`; `report.py` now
+prints allowed / blocked / rate_limited counts next to the headline
+metrics.
 
 ## Schema note (why db.py differs from raw v0.3)
 

@@ -1,4 +1,4 @@
-"""M1 report: headline metrics from attempts.db via GROUP BY.
+"""M1+M4 report: headline metrics from attempts.db via GROUP BY.
 
 Same headline shape as v0.3 (attempts, success rate, retries, average
 latency, tokens, cost), grouped by destination host / endpoint / method.
@@ -23,6 +23,10 @@ def main():
     attempts = totals["attempts"] or 0
     successes = totals["successes"] or 0
     rate = (100.0 * successes / attempts) if attempts else 0.0
+    outcomes = db_module.fetch_outcome_counts(conn)
+    print(f"allowed={outcomes['allowed']} blocked={outcomes['blocked']} "
+          f"rate_limited={outcomes['rate_limited']} "
+          f"other={outcomes['other']}")
     print(f"attempts={attempts} traces={totals['traces'] or 0} "
           f"successes={successes} success_rate={rate:.1f}% "
           f"retries={totals['retries'] or 0} "
