@@ -109,13 +109,7 @@ class M1ProxyTest(unittest.TestCase):
         self.assertEqual(row["input_tokens"], 42)  # only because upstream reported it
         self.assertEqual(row["cost_dollars"], 0.0)
 
-    def test_connect_is_not_supported_in_m1(self):
-        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=5)
-        conn.request("CONNECT", "127.0.0.1:443")
-        resp = conn.getresponse()
-        resp.read()
-        self.assertEqual(resp.status, 501)
-        conn.close()
+    # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
 
 if __name__ == "__main__":

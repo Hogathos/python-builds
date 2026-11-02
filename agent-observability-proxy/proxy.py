@@ -1,10 +1,13 @@
-"""M1: local HTTP forwarding proxy on 127.0.0.1:8888.
+"""M1+M2: local forwarding proxy on 127.0.0.1:8888.
 
-Forwards plain-HTTP requests to their real destination and logs one
-metadata-only row per request to the SQLite `attempts` table (see db.py).
+M1: forwards plain-HTTP requests to their real destination.
+M2: accepts CONNECT, establishes a raw TCP tunnel, and relays bytes
+both ways so HTTPS can pass through. The tunnel is never decrypted:
+no TLS interception, no MITM. Only tunnel metadata is logged (see
+db.py) - destination, timing, byte counts, result - never payload
+content, headers, keys, or bodies.
 
-M1 scope only: no CONNECT tunnelling, no TLS decryption, no allowlist,
-no rate limiting. CONNECT and absolute-https requests get 501.
+Out of scope: multi-agent traces (M3), allowlist / rate limiting (M4).
 
 Trace ID: an incoming X-Trace-Id is forwarded unchanged; if absent one
 is generated, added to the upstream request, and returned to the client
@@ -19,6 +22,8 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import select
+import socket
 import threading
 import time
 import uuid
@@ -84,6 +89,28 @@ class ProxyState:
             return len(stamps)
 
 
+def _relay(client: socket.socket, upstream: socket.socket) -> tuple[int, int]:
+    """Relay raw bytes both ways; return (bytes_in, bytes_out).
+
+    Bytes are counted, never inspected, stored, or logged. bytes_in is
+    client -> destination, bytes_out is destination -> client.
+    """
+    bytes_in = bytes_out = 0
+    sockets = [client, upstream]
+    while True:
+        readable, _, _ = select.select(sockets, [], [])
+        for sock in readable:
+            data = sock.recv(65536)
+            if not data:
+                return bytes_in, bytes_out
+            if sock is client:
+                upstream.sendall(data)
+                bytes_in += len(data)
+            else:
+                client.sendall(data)
+                bytes_out += len(data)
+
+
 def make_handler(state: ProxyState):
     class ProxyHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -91,14 +118,61 @@ def make_handler(state: ProxyState):
         def log_message(self, fmt, *args):  # keep stdout clean
             pass
 
-        # -- M1 explicitly does not tunnel. ----------------------------
+        # -- M2: CONNECT tunnelling, bytes only, never decrypted. -----
         def do_CONNECT(self):
-            body = b"CONNECT is M2 and is not supported in M1\n"
-            self.send_response(501)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
+            start = time.perf_counter()
+            trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
+            endpoint = self.path  # CONNECT authority form: host:port
+            if ":" in endpoint:
+                dest_host, port_text = endpoint.rsplit(":", 1)
+                try:
+                    dest_port = int(port_text)
+                except ValueError:
+                    dest_port = -1
+            else:
+                dest_host, dest_port = endpoint, 443
+            endpoint = f"{dest_host}:{dest_port}"
+            task_number = state.task_number(
+                trace_id, self.headers.get("X-Task-Number"))
+            attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
+            strategy = self.headers.get("X-Strategy") or "proxy"
+
+            def log_tunnel(status, bytes_in, bytes_out):
+                db_module.log_attempt(
+                    state.conn, trace_id=trace_id,
+                    task_number=task_number, attempt=attempt,
+                    strategy=strategy, status=status,
+                    latency_seconds=time.perf_counter() - start,
+                    retry_reason="retry" if attempt > 1 else "",
+                    dest_host=endpoint, endpoint=endpoint,
+                    method="CONNECT", bytes_in=bytes_in,
+                    bytes_out=bytes_out, http_status=None)
+
+            upstream = None
+            try:
+                upstream = socket.create_connection(
+                    (dest_host, dest_port), timeout=10)
+            except Exception:
+                self.send_response(502)
+                self.send_header("X-Trace-Id", trace_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                log_tunnel("failure", 0, 0)
+                return
+
+            self.send_response(200)
+            self.send_header("X-Trace-Id", trace_id)
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+            status, bytes_in, bytes_out = "success", 0, 0
+            try:
+                bytes_in, bytes_out = _relay(self.connection, upstream)
+            except Exception:
+                status = "failure"
+            finally:
+                upstream.close()
+            log_tunnel(status, bytes_in, bytes_out)
 
         def _target(self):
             """Return (host, port, endpoint) or None if unsupported."""
@@ -219,7 +293,7 @@ def serve(host: str = "127.0.0.1", port: int = 8888,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="M1 local HTTP proxy")
+    parser = argparse.ArgumentParser(description="M1+M2 local proxy (HTTP forward + CONNECT tunnel)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument("--db", default="attempts.db")

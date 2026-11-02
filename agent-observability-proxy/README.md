@@ -3,12 +3,19 @@
 Local proxy in the middle of agent traffic, so the log is real traffic.
 Built milestone by milestone from the 2026-11-01 proxy sketch.
 
-## Status: M1 (awaiting approval before M2)
+## Status: M2 (awaiting approval before M3)
 
 M1 is a plain-HTTP forwarding proxy to a local test server with
-metadata-only SQLite logging. No CONNECT tunnelling (M2), no
-multi-agent propagation demo (M3), no allowlist / rate limit / block
-test (M4) yet.
+metadata-only SQLite logging. M2 adds CONNECT tunnelling: the proxy
+accepts `CONNECT host:port`, opens a raw TCP tunnel, and relays bytes
+both ways so HTTPS traffic can pass through. The tunnel is never
+decrypted (no TLS interception, no MITM), and only metadata is logged
+per tunnel: destination host:port, method CONNECT, success/failure,
+latency, bytes in/out, and the trace ID (carried on the CONNECT
+request, or generated and returned in the `X-Trace-Id` response
+header). Payload content, headers, and keys are never logged.
+No multi-agent propagation demo (M3), no allowlist / rate limit /
+block test (M4) yet.
 
 ## Schema note (why db.py differs from raw v0.3)
 
