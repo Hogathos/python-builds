@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS attempts (
 
 def init_db(path: str) -> sqlite3.Connection:
     """Open (or create) the database at path and ensure the table exists."""
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=False)  # proxy logs from worker threads
     conn.execute(CREATE_TABLE_SQL)
     conn.commit()
     return conn
