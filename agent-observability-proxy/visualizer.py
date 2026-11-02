@@ -14,12 +14,18 @@ Run:
 """
 from __future__ import annotations
 
-import argparse
-import sqlite3
-import string
-from pathlib import Path
-
-import db as db_module
+@@
+-import argparse
+-import sqlite3
+-import string
+-from pathlib import Path
++import argparse
++import string
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    import sqlite3
 
 # Only these columns are read. No headers, keys, or bodies exist here.
 SAFE_COLUMNS = (
