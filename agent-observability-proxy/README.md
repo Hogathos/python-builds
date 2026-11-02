@@ -3,7 +3,7 @@
 Local proxy in the middle of agent traffic, so the log is real traffic.
 Built milestone by milestone from the 2026-11-01 proxy sketch.
 
-## Status: M2 (awaiting approval before M3)
+## Status: M3 (awaiting approval before M4)
 
 M1 is a plain-HTTP forwarding proxy to a local test server with
 metadata-only SQLite logging. M2 adds CONNECT tunnelling: the proxy
@@ -14,7 +14,16 @@ per tunnel: destination host:port, method CONNECT, success/failure,
 latency, bytes in/out, and the trace ID (carried on the CONNECT
 request, or generated and returned in the `X-Trace-Id` response
 header). Payload content, headers, and keys are never logged.
-No multi-agent propagation demo (M3), no allowlist / rate limit /
+M3 adds the two-agent trace demo: Agent A calls Agent B through the
+proxy, and Agent B calls the upstream test server through the proxy
+again, with one `X-Trace-Id` carried across both legs. If A sends no
+trace ID, the proxy generates one on the first leg, returns it, and
+that same ID is forwarded to B and carried on B's downstream call.
+Every attempt from both legs is logged under that one trace_id, with
+dest_host / endpoint distinguishing the A leg (Agent B's /task) from
+the B leg (upstream /echo). Run it with `python demo_two_agents.py`
+or the tests in `tests/test_trace_propagation.py`; Agent B standalone
+is `python agent_b.py --port 18081`. No allowlist / rate limit /
 block test (M4) yet.
 
 ## Schema note (why db.py differs from raw v0.3)

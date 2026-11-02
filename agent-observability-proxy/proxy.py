@@ -7,7 +7,10 @@ no TLS interception, no MITM. Only tunnel metadata is logged (see
 db.py) - destination, timing, byte counts, result - never payload
 content, headers, keys, or bodies.
 
-Out of scope: multi-agent traces (M3), allowlist / rate limiting (M4).
+M3: the trace ID above is carried across two agents (A -> proxy
+-> B -> proxy -> upstream) with no change to M1/M2 behaviour; both
+legs log under the same trace_id, distinguished by dest/endpoint.
+Out of scope: allowlist / rate limiting (M4).
 
 Trace ID: an incoming X-Trace-Id is forwarded unchanged; if absent one
 is generated, added to the upstream request, and returned to the client
