@@ -1,22 +1,14 @@
 """Visualizer v1 tests: headline math, A/B/C verdicts, demo-only, no secrets."""
-@@
- import os
- import sqlite3
- import sys
- import tempfile
- import unittest
- 
- sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
- 
--import db as db_module
--import visualizer
-+import db as db_module  # noqa: E402
-+import visualizer  # noqa: E402
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import db as db_module
-import visualizer
+import db as db_module  # noqa: E402
+import visualizer  # noqa: E402
 
 
 class VisualizerTest(unittest.TestCase):
