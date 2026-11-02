@@ -6,7 +6,7 @@ in plain text plus a Mermaid flowchart GitHub renders natively.
 
 Safety: only an allowlist of metadata columns is ever read. Authorization
 headers, API keys, and prompt/response bodies are never queried, logged,
-or written to the output. Non-loopback (real) traffic is excluded.
+nor written to the output. Non-loopback (real) traffic is excluded.
 
 Run:
   python visualizer.py --db attempts.db --output trace-diagram.md
@@ -14,18 +14,12 @@ Run:
 """
 from __future__ import annotations
 
-@@
--import argparse
--import sqlite3
--import string
--from pathlib import Path
-+import argparse
-+import string
-+from pathlib import Path
-+from typing import TYPE_CHECKING
-+
-+if TYPE_CHECKING:
-+    import sqlite3
+import argparse
+import sqlite3
+import string
+from pathlib import Path
+
+import db as db_module
 
 # Only these columns are read. No headers, keys, or bodies exist here.
 SAFE_COLUMNS = (
