@@ -117,17 +117,21 @@ Ask yourself first, every task:
 
 ## 8. Docs — two jobs, from Malm's rule
 
-- `README.md` = someone opens the repo and needs a quick summary of what
-  is going on. Short, current, no stale milestones.
-- `docs/` = so detailed a new agent can crack it open and know where the
-  human's head was when they were last coding. Decisions, dead ends,
-  open questions, and next steps live here, not just in chat.
-- Agents can document everything now — there is no excuse for docs that
-  were never maintained. Update docs in the same change as the code, not later.
-- Use files as memory. Do not rely on holding everything in conversation
-  context. If context gets long, stop before it compacts, write a handoff
-  file first (state, what was done, what was verified, what is next,
-  open questions), then tell the human you stopped for a handoff.
+## 8. Docs — three jobs, from Malm's rule, corrected
+
+- README.md = human quick summary. Short, current, no stale milestones.
+- AGENTS.md = agent contract. Rules, gates, and hard stops. This file.
+- docs/ = agent handoff. Detailed enough a new agent knows where the
+  human's head was: decisions, dead ends, open questions, next steps,
+  and what needs the human's word.
+- Agents can draft everything now — that does not mean document
+  everything. Document decisions + evidence, prune the rest.
+- Update docs in the same change as the code. A doc that claims a
+  test, push, merge, or CI result must cite the verified run for
+  that exact commit.
+- Use files as memory, with a commit SHA and date, so a later agent
+  can tell if a handoff is stale. If context gets long, stop before
+  it compacts, write a handoff first, then tell the human you stopped.
 
 ## 9. Communication — how to talk to the human
 
