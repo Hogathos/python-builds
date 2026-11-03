@@ -1,0 +1,90 @@
+{
+  "manifest": {
+    "dataset_version": "v1",
+    "version": "1.0",
+    "date": "2026-11-02",
+    "source": "M1-M4 demos and tests in agent-observability-proxy at main 7cdc6c9 (M1 logging, M2 CONNECT, M3 two-agent trace, M4 allowlist/rate limit)",
+    "how_to_run": "python evals/scorer.py --dataset evals/golden_dataset_v1.json",
+    "versioning_rule": "Never silently edit v1 expected outputs after scoring. Any changed expectation goes in a v2 file with a changelog note stating what changed and why.",
+    "scope": "Local loopback demo traces only. No real hosts, keys, or traffic. Cost is $0.0000 unless the upstream reports it; never invented."
+  },
+  "cases": [
+    {
+      "id": "m1-echo-supplied-trace",
+      "milestone": "M1",
+      "category": "M1 logging",
+      "scenario": {"type": "http", "method": "GET", "endpoint": "/echo", "destination": "upstream", "trace_id": "trace-golden-m1", "trace_handling": "supplied trace preserved"},
+      "expected": {"http_status": 200, "rows": 1, "row_status": "success", "method": "GET", "endpoint": "/echo", "trace_id": "trace-golden-m1", "bytes_out_min": 1, "latency_present": true, "cost_dollars": 0.0}
+    },
+    {
+      "id": "m1-echo-generated-trace",
+      "milestone": "M1",
+      "category": "M1 logging",
+      "scenario": {"type": "http", "method": "GET", "endpoint": "/echo", "destination": "upstream", "trace_id": null, "trace_handling": "no trace sent; proxy generates one and returns it"},
+      "expected": {"http_status": 200, "rows": 1, "row_status": "success", "generated_trace_returned": true, "bytes_out_min": 1, "latency_present": true}
+    },
+    {
+      "id": "m2-connect-tunnel",
+      "milestone": "M2",
+      "category": "M2 CONNECT",
+      "scenario": {"type": "connect_echo", "destination": "echo_server", "trace_id": "trace-golden-m2", "payload_label": "tunnel payload (echoed, never logged)"},
+      "expected": {"http_status": 200, "rows": 1, "row_status": "success", "method": "CONNECT", "trace_id": "trace-golden-m2", "bytes_in_min": 10, "bytes_out_min": 10, "echo_matches": true}
+    },
+    {
+      "id": "m2-connect-failed",
+      "milestone": "M2",
+      "category": "M2 CONNECT",
+      "scenario": {"type": "connect_closed_port", "destination": "closed_port", "trace_id": "trace-golden-m2-fail"},
+      "expected": {"http_status": 502, "rows": 1, "row_status": "failure", "method": "CONNECT", "zero_forwarded_bytes": true}
+    },
+    {
+      "id": "m3-two-agent-trace",
+      "milestone": "M3",
+      "category": "M3 two-agent trace",
+      "scenario": {"type": "two_agent", "trace_id": "trace-golden-m3", "trace_handling": "A sends trace; B carries same ID downstream"},
+      "expected": {"http_status": 200, "rows": 2, "distinct_trace_ids": 1, "distinct_task_numbers": 1, "legs": {"a_endpoint": "/task", "b_endpoint": "/echo"}, "row_status": "success"}
+    },
+    {
+      "id": "m4-allowlist-pass",
+      "milestone": "M4",
+      "category": "M4 allowlist pass",
+      "scenario": {"type": "http", "method": "GET", "endpoint": "/echo", "destination": "upstream", "trace_id": "trace-golden-m4-pass", "allowlist": "default local test hosts"},
+      "expected": {"http_status": 200, "rows": 1, "outcome": "allowed", "row_status": "success", "trace_id": "trace-golden-m4-pass"}
+    },
+    {
+      "id": "m4-block-http",
+      "milestone": "M4",
+      "category": "M4 allowlist block",
+      "scenario": {"type": "http", "method": "POST", "endpoint": "/echo", "destination": "exfil.example.test", "trace_id": "trace-golden-m4-block"},
+      "expected": {"http_status": 403, "rows": 1, "outcome": "blocked", "reason": "not_allowlisted", "row_status": "blocked", "zero_forwarded_bytes": true, "trace_id": "trace-golden-m4-block"}
+    },
+    {
+      "id": "m4-block-connect",
+      "milestone": "M4",
+      "category": "M4 allowlist block",
+      "scenario": {"type": "connect_raw", "destination": "exfil.example.test:443", "trace_id": "trace-golden-m4-cblock"},
+      "expected": {"http_status": 403, "rows": 1, "outcome": "blocked", "reason": "not_allowlisted", "row_status": "blocked", "method": "CONNECT", "zero_forwarded_bytes": true}
+    },
+    {
+      "id": "m4-rate-limit-burst",
+      "milestone": "M4",
+      "category": "M4 rate limit",
+      "scenario": {"type": "burst", "endpoint": "/echo", "destination": "upstream", "rate_limit": 5, "rate_window_seconds": 1.0, "burst_count": 7, "pause_seconds": 1.2, "recovery_call": true},
+      "expected": {"statuses": [200, 200, 200, 200, 200, 429, 429, 200], "outcome_counts": {"allowed": 6, "rate_limited": 2}, "rows": 8}
+    },
+    {
+      "id": "m4-outcome-accounting",
+      "milestone": "M4",
+      "category": "M4 outcome accounting",
+      "scenario": {"type": "outcome_accounting", "seed_legacy_rows": 2, "then": "one allowed /echo call and one blocked exfil call", "trace_id": "trace-golden-m4-acct"},
+      "expected": {"rows": 4, "outcome_counts": {"allowed": 1, "blocked": 1, "other": 2}, "outcome_sum_equals_attempts": true}
+    },
+    {
+      "id": "secrets-never-logged",
+      "milestone": "M4",
+      "category": "Secrets",
+      "scenario": {"type": "http", "method": "POST", "endpoint": "/echo", "destination": "upstream", "trace_id": "trace-golden-secrets", "secret_body": "SECRET_GOLDEN_BODY_12345", "secret_key": "SECRET_GOLDEN_KEY_67890", "authorization": "Bearer [REDACTED]"},
+      "expected": {"http_status": 200, "rows": 1, "secrets_absent_from_dump": true, "secrets_absent_from_output": true}
+    }
+  ]
+}
