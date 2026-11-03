@@ -115,8 +115,6 @@ Ask yourself first, every task:
 - Report back, every time: files changed, test count, demo/report numbers,
   secrets result, and what is still open. Then stop.
 
-## 8. Docs — two jobs, from Malm's rule
-
 ## 8. Docs — three jobs, from Malm's rule, corrected
 
 - README.md = human quick summary. Short, current, no stale milestones.
