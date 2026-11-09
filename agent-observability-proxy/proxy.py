@@ -92,10 +92,28 @@ class ProxyState:
         self._rate_stamps: dict[str, list[float]] = {}
 
     def is_allowed(self, dest_host: str, dest_port: int) -> bool:
-        """Allowlist entries are hosts, or host:port for one exact port."""
-        host = dest_host.lower()
+        """Allowlist entries are hosts, or host:port for one exact port.
+
+        A bare host (IPv4, hostname, or IPv6 with or without brackets)
+        matches on any port. A host:port entry matches only that exact
+        port; IPv6 host:port must use brackets ([::1]:18080).
+        """
+        host = dest_host.strip().lower()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         for entry in self.allowlist:
-            if ":" in entry and not entry.startswith("["):
+            if entry.startswith("["):
+                if "]:" in entry:
+                    ehost, _, eport = entry[1:].partition("]:")
+                    try:
+                        if ehost == host and int(eport) == dest_port:
+                            return True
+                    except ValueError:
+                        continue
+                elif entry.endswith("]"):
+                    if entry[1:-1] == host:
+                        return True
+            elif entry.count(":") == 1:
                 if entry == f"{host}:{dest_port}":
                     return True
             elif entry == host:

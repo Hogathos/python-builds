@@ -152,6 +152,36 @@ class M4AllowlistRateLimitTest(unittest.TestCase):
         self.assertEqual(_CountingHandler.hits - hits_before, 6)
 
 
+    def test_ipv6_loopback_allowed_not_403(self):
+        import http.client
+        import socket
+        state = self.proxy.state
+        self.assertTrue(state.is_allowed("::1", 18080))
+        self.assertTrue(state.is_allowed("[::1]", 18080))
+
+        class IPv6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        upstream6 = IPv6Server(("::1", 0), server_module.Handler)
+        port = upstream6.server_address[1]
+        threading.Thread(target=upstream6.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.proxy_port, timeout=10)
+            conn.request("GET", f"http://[::1]:{port}/echo",
+                         headers={"X-Trace-Id": "trace-ipv6-t1"})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 200)
+            conn.close()
+        finally:
+            upstream6.shutdown()
+            upstream6.server_close()
+        row = self.rows(trace="trace-ipv6-t1")[-1]
+        self.assertEqual(row["outcome"], "allowed")
+        self.assertEqual(row["status"], "success")
+
+
 class OutcomeCountsTest(unittest.TestCase):
     def test_legacy_and_unknown_outcomes_counted_as_other(self):
         import db as db_module
