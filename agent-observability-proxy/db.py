@@ -87,9 +87,9 @@ def log_attempt(
     reason: str = "",
 ) -> None:
     """Insert one metadata-only attempt row and commit it."""
-    if created_at is None:
-        created_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     with _write_lock:
+        if created_at is None:
+            created_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         conn.execute(
             """
             INSERT INTO attempts
