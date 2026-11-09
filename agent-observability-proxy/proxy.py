@@ -277,7 +277,11 @@ def make_handler(state: ProxyState):
             log_tunnel(status, bytes_in, bytes_out)
 
         def _target(self):
-            """Return (host, port, endpoint) or None if unsupported."""
+            """Return (host, port, endpoint), None if unsupported.
+
+            Raises ValueError when the destination is malformed (bad
+            port); the caller answers 400 and logs a row.
+            """
             parsed = urlparse(self.path)
             if parsed.scheme in ("http", "https") and parsed.hostname:
                 if parsed.scheme != "http":
@@ -294,10 +298,40 @@ def make_handler(state: ProxyState):
                 return host, int(port), self.path
             return host_header, 80, self.path
 
+        def _reject_malformed_header(self, state, trace_id, start):
+            """400 plus an audit row for an unparseable destination."""
+            task_number = state.task_number(
+                trace_id, self.headers.get("X-Task-Number"))
+            attempt = state.next_attempt(trace_id, self.path, self.command)
+            strategy = self.headers.get("X-Strategy") or "proxy"
+            body = b"failure: request not forwarded by proxy\n"
+            db_module.log_attempt(
+                state.conn, trace_id=trace_id,
+                task_number=task_number, attempt=attempt,
+                strategy=strategy, status="failure",
+                latency_seconds=time.perf_counter() - start,
+                retry_reason="retry" if attempt > 1 else "",
+                dest_host=self.headers.get("Host") or "",
+                endpoint=self.path,
+                method=self.command, bytes_in=0, bytes_out=0,
+                http_status=400, outcome="failure",
+                reason="malformed_header")
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Trace-Id", trace_id)
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
         def _handle(self):
             start = time.perf_counter()
             trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
-            target = self._target()
+            try:
+                target = self._target()
+            except ValueError:
+                self._reject_malformed_header(state, trace_id, start)
+                return
             if target is None:
                 body = b"Only absolute http:// URLs are supported in M1\n"
                 self.send_response(501)
@@ -342,7 +376,11 @@ def make_handler(state: ProxyState):
                 reject(429, "rate_limited", "rate_limited")
                 return
 
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                reject(400, "failure", "malformed_header")
+                return
             request_body = self.rfile.read(length) if length else b""
 
             headers = {}

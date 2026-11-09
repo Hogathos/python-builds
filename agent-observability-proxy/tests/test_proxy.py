@@ -109,6 +109,55 @@ class M1ProxyTest(unittest.TestCase):
         self.assertEqual(row["input_tokens"], 42)  # only because upstream reported it
         self.assertEqual(row["cost_dollars"], 0.0)
 
+    def test_malformed_content_length_gets_400_and_log_row(self):
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("GET", f"{self.base}/echo",
+                     headers={"Content-Length": "abc",
+                              "X-Trace-Id": "trace-malformed-cl"})
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(resp.getheader("X-Trace-Id"), "trace-malformed-cl")
+        conn.close()
+        rows = [r for r in self.rows()
+                if r["trace_id"] == "trace-malformed-cl"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["http_status"], 400)
+        self.assertEqual(rows[0]["reason"], "malformed_header")
+        self.assertEqual((rows[0]["bytes_in"], rows[0]["bytes_out"]), (0, 0))
+
+    def test_malformed_host_port_gets_400_and_log_row(self):
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.proxy_port, timeout=10)
+        conn.putrequest("GET", "/echo", skip_host=1)
+        conn.putheader("Host", "127.0.0.1:abc")
+        conn.putheader("X-Trace-Id", "trace-malformed-host")
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 400)
+        conn.close()
+        rows = [r for r in self.rows()
+                if r["trace_id"] == "trace-malformed-host"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["http_status"], 400)
+        self.assertEqual(rows[0]["reason"], "malformed_header")
+        self.assertEqual((rows[0]["bytes_in"], rows[0]["bytes_out"]), (0, 0))
+
+        conn2 = http.client.HTTPConnection(
+            "127.0.0.1", self.proxy_port, timeout=10)
+        conn2.request("GET", "http://127.0.0.1:abc/echo",
+                      headers={"X-Trace-Id": "trace-malformed-urlport"})
+        resp2 = conn2.getresponse()
+        resp2.read()
+        self.assertEqual(resp2.status, 400)
+        conn2.close()
+        rows2 = [r for r in self.rows()
+                 if r["trace_id"] == "trace-malformed-urlport"]
+        self.assertEqual(len(rows2), 1)
+        self.assertEqual(rows2[0]["reason"], "malformed_header")
+
     # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
 
