@@ -158,6 +158,15 @@ class M1ProxyTest(unittest.TestCase):
         self.assertEqual(len(rows2), 1)
         self.assertEqual(rows2[0]["reason"], "malformed_header")
 
+    def test_retry_key_includes_method_get_post_get_is_1_1_2(self):
+        self.get("/echo", trace="trace-method-key")
+        self.get("/echo", trace="trace-method-key", data=b"{}")
+        self.get("/echo", trace="trace-method-key")
+        mine = [r for r in self.rows() if r["trace_id"] == "trace-method-key"]
+        self.assertEqual([r["method"] for r in mine], ["GET", "POST", "GET"])
+        self.assertEqual([r["attempt"] for r in mine], [1, 1, 2])
+        self.assertEqual(mine[2]["retry_reason"], "retry")
+
     # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
 

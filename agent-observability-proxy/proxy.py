@@ -88,7 +88,7 @@ class ProxyState:
         self._lock = threading.Lock()
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
-        self._attempts: dict[tuple[str, str], list[float]] = {}
+        self._attempts: dict[tuple[str, str, str], list[float]] = {}
         self._rate_stamps: dict[str, list[float]] = {}
 
     def is_allowed(self, dest_host: str, dest_port: int) -> bool:
@@ -146,9 +146,9 @@ class ProxyState:
             return self._task_by_trace[trace_id]
 
     def next_attempt(self, trace_id: str, endpoint: str, method: str) -> int:
-        # Retry grouping per sketch: same trace_id + endpoint in window.
+        # Retry grouping: same trace_id + endpoint + method in window.
         now = time.time()
-        key = (trace_id, endpoint)
+        key = (trace_id, endpoint, method)
         with self._lock:
             stamps = [t for t in self._attempts.get(key, [])
                       if now - t <= self.retry_window]
