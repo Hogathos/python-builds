@@ -15,6 +15,9 @@ from __future__ import annotations
 import datetime
 import os
 import sqlite3
+import threading
+
+_write_lock = threading.Lock()
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS attempts (
@@ -86,37 +89,38 @@ def log_attempt(
     """Insert one metadata-only attempt row and commit it."""
     if created_at is None:
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    conn.execute(
-        """
-        INSERT INTO attempts
-        (trace_id, task_number, attempt, strategy, status,
-         latency_seconds, input_tokens, cost_dollars, retry_reason, created_at,
-         dest_host, endpoint, method, bytes_in, bytes_out, http_status,
-         outcome, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            trace_id,
-            task_number,
-            attempt,
-            strategy,
-            status,
-            latency_seconds,
-            input_tokens,
-            cost_dollars,
-            retry_reason,
-            created_at,
-            dest_host,
-            endpoint,
-            method,
-            bytes_in,
-            bytes_out,
-            http_status,
-            outcome,
-            reason,
-        ),
-    )
-    conn.commit()
+    with _write_lock:
+        conn.execute(
+            """
+            INSERT INTO attempts
+            (trace_id, task_number, attempt, strategy, status,
+             latency_seconds, input_tokens, cost_dollars, retry_reason, created_at,
+             dest_host, endpoint, method, bytes_in, bytes_out, http_status,
+             outcome, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace_id,
+                task_number,
+                attempt,
+                strategy,
+                status,
+                latency_seconds,
+                input_tokens,
+                cost_dollars,
+                retry_reason,
+                created_at,
+                dest_host,
+                endpoint,
+                method,
+                bytes_in,
+                bytes_out,
+                http_status,
+                outcome,
+                reason,
+            ),
+        )
+        conn.commit()
 
 
 def fetch_totals(conn):
