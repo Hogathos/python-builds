@@ -182,6 +182,19 @@ class M4AllowlistRateLimitTest(unittest.TestCase):
         self.assertEqual(row["status"], "success")
 
 
+    def test_blocked_arrival_does_not_consume_attempt_number(self):
+        blocked, _, _ = self.call(
+            "http://exfil.example.test/echo", self.proxy_port,
+            trace="trace-attempt-key")
+        self.assertEqual(blocked, 403)
+        allowed, _, _ = self.call(
+            f"{self.base}/echo", self.proxy_port, trace="trace-attempt-key")
+        self.assertEqual(allowed, 200)
+        mine = self.rows(trace="trace-attempt-key")
+        self.assertEqual([r["status"] for r in mine], ["blocked", "success"])
+        self.assertEqual([r["attempt"] for r in mine], [1, 1])
+
+
 class OutcomeCountsTest(unittest.TestCase):
     def test_legacy_and_unknown_outcomes_counted_as_other(self):
         import db as db_module

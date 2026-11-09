@@ -156,6 +156,17 @@ class ProxyState:
             self._attempts[key] = stamps
             return len(stamps)
 
+    def peek_attempt(self, trace_id: str, endpoint: str, method: str) -> int:
+        # Would-be attempt number: counted, never consumed. Refused
+        # requests log this so their rows stay numbered without shifting
+        # the numbering of forwarded requests.
+        now = time.time()
+        key = (trace_id, endpoint, method)
+        with self._lock:
+            fresh = [t for t in self._attempts.get(key, [])
+                     if now - t <= self.retry_window]
+            return len(fresh) + 1
+
 
 def _relay(client: socket.socket, upstream: socket.socket) -> tuple[int, int]:
     """Relay raw bytes both ways; return (bytes_in, bytes_out).
@@ -202,7 +213,6 @@ def make_handler(state: ProxyState):
             endpoint = f"{dest_host}:{dest_port}"
             task_number = state.task_number(
                 trace_id, self.headers.get("X-Task-Number"))
-            attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
             strategy = self.headers.get("X-Strategy") or "proxy"
 
             def log_tunnel(status, bytes_in, bytes_out):
@@ -218,6 +228,7 @@ def make_handler(state: ProxyState):
                     outcome="allowed", reason="")
 
             if not state.is_allowed(dest_host, dest_port):
+                attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
                 db_module.log_attempt(
                     state.conn, trace_id=trace_id,
                     task_number=task_number, attempt=attempt,
@@ -234,6 +245,7 @@ def make_handler(state: ProxyState):
                 self.end_headers()
                 return
             if not state.check_rate(endpoint):
+                attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
                 db_module.log_attempt(
                     state.conn, trace_id=trace_id,
                     task_number=task_number, attempt=attempt,
@@ -250,6 +262,8 @@ def make_handler(state: ProxyState):
                 self.end_headers()
                 return
 
+            # Numbered only once the tunnel will actually be opened.
+            attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
             upstream = None
             try:
                 upstream = socket.create_connection(
@@ -347,7 +361,6 @@ def make_handler(state: ProxyState):
                           else f"{dest_host}:{dest_port}")
             task_number = state.task_number(
                 trace_id, self.headers.get("X-Task-Number"))
-            attempt = state.next_attempt(trace_id, endpoint, self.command)
             strategy = self.headers.get("X-Strategy") or "proxy"
 
             def reject(code, status, reason):
@@ -370,12 +383,16 @@ def make_handler(state: ProxyState):
                 self.close_connection = True
 
             if not state.is_allowed(dest_host, dest_port):
+                attempt = state.peek_attempt(trace_id, endpoint, self.command)
                 reject(403, "blocked", "not_allowlisted")
                 return
             if not state.check_rate(dest_label):
+                attempt = state.peek_attempt(trace_id, endpoint, self.command)
                 reject(429, "rate_limited", "rate_limited")
                 return
 
+            # Numbered only once the request will actually be forwarded.
+            attempt = state.next_attempt(trace_id, endpoint, self.command)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
