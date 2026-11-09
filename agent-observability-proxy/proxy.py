@@ -48,6 +48,7 @@ import db as db_module
 DEFAULT_ALLOWLIST = ("127.0.0.1", "localhost", "::1")
 RATE_LIMIT = 100            # max forwarded requests per destination ...
 RATE_WINDOW_SECONDS = 10.0  # ... inside this sliding window
+RELAY_IDLE_TIMEOUT_SECONDS = 30.0  # tunnel silence before relay gives up
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-connection", "proxy-authorization",
@@ -76,7 +77,8 @@ def _usage_input_tokens(body: bytes, content_type: str) -> int:
 class ProxyState:
     def __init__(self, db_path: str, retry_window: float = 10.0,
                  allowlist=None, rate_limit: int = RATE_LIMIT,
-                 rate_window: float = RATE_WINDOW_SECONDS):
+                 rate_window: float = RATE_WINDOW_SECONDS,
+                 relay_timeout: float = RELAY_IDLE_TIMEOUT_SECONDS):
         self.conn = db_module.init_db(db_path)
         self.retry_window = retry_window
         self.allowlist = tuple(
@@ -85,6 +87,7 @@ class ProxyState:
             if entry.strip())
         self.rate_limit = int(rate_limit)
         self.rate_window = float(rate_window)
+        self.relay_timeout = float(relay_timeout)
         self._lock = threading.Lock()
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
@@ -168,16 +171,29 @@ class ProxyState:
             return len(fresh) + 1
 
 
-def _relay(client: socket.socket, upstream: socket.socket) -> tuple[int, int]:
+class _RelayTimeout(Exception):
+    """Relay idle past the timeout; carries bytes relayed so far."""
+
+    def __init__(self, bytes_in: int, bytes_out: int):
+        super().__init__("relay idle past timeout")
+        self.bytes_in = bytes_in
+        self.bytes_out = bytes_out
+
+
+def _relay(client: socket.socket, upstream: socket.socket,
+           timeout: float = RELAY_IDLE_TIMEOUT_SECONDS) -> tuple[int, int]:
     """Relay raw bytes both ways; return (bytes_in, bytes_out).
 
     Bytes are counted, never inspected, stored, or logged. bytes_in is
-    client -> destination, bytes_out is destination -> client.
+    client -> destination, bytes_out is destination -> client. Silence
+    longer than timeout raises _RelayTimeout with partial counts.
     """
     bytes_in = bytes_out = 0
     sockets = [client, upstream]
     while True:
-        readable, _, _ = select.select(sockets, [], [])
+        readable, _, _ = select.select(sockets, [], [], timeout)
+        if not readable:
+            raise _RelayTimeout(bytes_in, bytes_out)
         for sock in readable:
             data = sock.recv(65536)
             if not data:
@@ -283,7 +299,11 @@ def make_handler(state: ProxyState):
             self.close_connection = True
             status, bytes_in, bytes_out = "success", 0, 0
             try:
-                bytes_in, bytes_out = _relay(self.connection, upstream)
+                bytes_in, bytes_out = _relay(
+                    self.connection, upstream, timeout=state.relay_timeout)
+            except _RelayTimeout as exc:
+                status = "failure"
+                bytes_in, bytes_out = exc.bytes_in, exc.bytes_out
             except Exception:
                 status = "failure"
             finally:
@@ -472,9 +492,12 @@ def make_handler(state: ProxyState):
 def serve(host: str = "127.0.0.1", port: int = 8888,
           db_path: str = "attempts.db", allowlist=None,
           rate_limit: int = RATE_LIMIT,
-          rate_window: float = RATE_WINDOW_SECONDS) -> ThreadingHTTPServer:
+          rate_window: float = RATE_WINDOW_SECONDS,
+          relay_timeout: float = RELAY_IDLE_TIMEOUT_SECONDS
+          ) -> ThreadingHTTPServer:
     state = ProxyState(db_path, allowlist=allowlist,
-                       rate_limit=rate_limit, rate_window=rate_window)
+                       rate_limit=rate_limit, rate_window=rate_window,
+                       relay_timeout=relay_timeout)
     server = ThreadingHTTPServer((host, port), make_handler(state))
     server.state = state  # type: ignore[attr-defined]
     return server

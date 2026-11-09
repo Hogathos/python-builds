@@ -132,5 +132,43 @@ class M2ConnectTest(unittest.TestCase):
         self.assertEqual((row["bytes_in"], row["bytes_out"]), (0, 0))
 
 
+    def test_idle_tunnel_times_out_and_logs_failure(self):
+        tmp = tempfile.TemporaryDirectory()
+        db_path = os.path.join(tmp.name, "idle.db")
+        proxy = proxy_module.serve(
+            "127.0.0.1", 0, db_path, relay_timeout=0.3)
+        port = proxy.server_address[1]
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sock.sendall(
+                f"CONNECT {self.dest} HTTP/1.1\r\nHost: {self.dest}\r\n"
+                "X-Trace-Id: trace-idle-t5\r\n\r\n".encode())
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = sock.recv(65536)
+                self.assertTrue(chunk)
+                raw += chunk
+            self.assertEqual(int(raw.split(b"\r\n", 1)[0].split()[1]), 200)
+            try:
+                self.assertEqual(sock.recv(65536), b"")
+            except socket.timeout:
+                self.fail("idle tunnel never closed")
+            sock.close()
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = [r for r in conn.execute("SELECT * FROM attempts")
+                    if r["trace_id"] == "trace-idle-t5"]
+            conn.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "failure")
+            self.assertEqual((rows[0]["bytes_in"], rows[0]["bytes_out"]), (0, 0))
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            proxy.state.conn.close()
+            tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
