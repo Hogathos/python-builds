@@ -1,12 +1,19 @@
-"""Visualizer v1: M1 attempts database -> trace-diagram.md for GitHub.
+"""Visualizer v2: M1 attempts database -> trace-diagram.md for GitHub.
 
 Reads demo traces only (local test server, loopback destination) from the
 SQLite `attempts` table and writes one Markdown file with headline numbers
 in plain text plus a Mermaid flowchart GitHub renders natively.
 
+v2 fixes Malm's v1 nits: traces are sorted by trace ID so Trace A is
+always first (not C, B, A); long traces collapse middle retries into one
+summary node; endpoints show path plus argument count only, and POST
+attempts show method, endpoint, bytes, and argument count only — never
+argument values or bodies.
+
 Safety: only an allowlist of metadata columns is ever read. Authorization
-headers, API keys, and prompt/response bodies are never queried, logged,
-nor written to the output. Non-loopback (real) traffic is excluded.
+headers, API keys, argument values, and prompt/response bodies are never
+queried, logged, nor written to the output. Non-loopback (real) traffic
+is excluded.
 
 Run:
   python visualizer.py --db attempts.db --output trace-diagram.md
@@ -21,12 +28,16 @@ from pathlib import Path
 
 import db as db_module
 
-# Only these columns are read. No headers, keys, or bodies exist here.
+# Only these columns are read. No headers, keys, values, or bodies exist here.
 SAFE_COLUMNS = (
     "id, trace_id, task_number, attempt, status, latency_seconds, "
     "input_tokens, cost_dollars, retry_reason, created_at, "
     "endpoint, method, http_status"
 )
+
+BYTES_COLUMNS = "bytes_in, bytes_out"
+
+MAX_DETAIL_STEPS = 5  # longer traces collapse middle retries
 
 DEMO_DEST_PREFIXES = ("127.0.0.1", "localhost", "::1")
 
@@ -46,17 +57,24 @@ def fetch_demo_attempts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            f"SELECT {SAFE_COLUMNS}, dest_host FROM attempts ORDER BY id"
+            f"SELECT {SAFE_COLUMNS}, dest_host, {BYTES_COLUMNS} FROM attempts ORDER BY id"
         ).fetchall()
     except sqlite3.OperationalError:
-        rows = conn.execute(
-            f"SELECT {SAFE_COLUMNS}, '' AS dest_host FROM attempts ORDER BY id"
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                f"SELECT {SAFE_COLUMNS}, dest_host, 0 AS bytes_in, 0 AS bytes_out "
+                "FROM attempts ORDER BY id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                f"SELECT {SAFE_COLUMNS}, '' AS dest_host, 0 AS bytes_in, 0 AS bytes_out "
+                "FROM attempts ORDER BY id"
+            ).fetchall()
     return [r for r in rows if is_demo_row(r)]
 
 
 def trace_label(index: int) -> str:
-    """0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA (first-appearance order)."""
+    """0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA (trace_id sort order)."""
     label = ""
     n = index
     while True:
@@ -67,17 +85,16 @@ def trace_label(index: int) -> str:
 
 
 def group_traces(rows: list[sqlite3.Row]) -> list[dict]:
-    traces: list[dict] = []
     by_id: dict[str, dict] = {}
     for row in rows:
         trace = by_id.get(row["trace_id"])
         if trace is None:
-            trace = {"trace_id": row["trace_id"], "label": trace_label(len(traces)),
-                     "steps": []}
+            trace = {"trace_id": row["trace_id"], "label": "", "steps": []}
             by_id[row["trace_id"]] = trace
-            traces.append(trace)
         trace["steps"].append(row)
-    for trace in traces:
+    traces = sorted(by_id.values(), key=lambda t: t["trace_id"])
+    for i, trace in enumerate(traces):
+        trace["label"] = trace_label(i)
         trace["steps"].sort(key=lambda r: (r["attempt"], r["id"]))
     return traces
 
@@ -120,19 +137,64 @@ def _clean(text: object) -> str:
     return " ".join(out.split())
 
 
+def _split_endpoint(endpoint: object) -> tuple[str, int]:
+    """Split endpoint into (path, arg_count), dropping query values.
+
+    Only the path and the number of query arguments are ever shown.
+    Argument names and values are never returned.
+    """
+    text = str(endpoint or "/")
+    text = text.split("#", 1)[0]
+    if "?" not in text:
+        return (text or "/", 0)
+    path, query = text.split("?", 1)
+    args = [p for p in query.split("&") if p.strip()]
+    return ((path or "/"), len(args))
+
+
 def _step_label(row: sqlite3.Row) -> str:
     ok = row["status"] == "success"
     mark = "SUCCESS" if ok else "FAILED"
     icon = "✅" if ok else "❌"
     retry = " - RETRY" if row["attempt"] > 1 else ""
-    endpoint = _clean(row["endpoint"] or "/")
+    path, arg_count = _split_endpoint(row["endpoint"] or "/")
+    path = _clean(path)
     method = _clean(row["method"] or "")
+    args = f" ({arg_count} args)" if arg_count else ""
     http = f" - HTTP {row['http_status']}" if row["http_status"] is not None else ""
     latency = float(row["latency_seconds"] or 0.0)
     cost = float(row["cost_dollars"] or 0.0)
+    keys = row.keys()
+    bytes_in = int(row["bytes_in"] or 0) if "bytes_in" in keys else 0
+    bytes_out = int(row["bytes_out"] or 0) if "bytes_out" in keys else 0
+    byte_part = f" - {bytes_in}B in / {bytes_out}B out"
     return (f"{icon} Attempt {int(row['attempt'])}{retry}: {mark}<br/>"
-            f"{method} {endpoint}{http}<br/>"
-            f"cost ${cost:.4f} - latency {latency:.2f}s")
+            f"{method} {path}{args}{http}<br/>"
+            f"cost ${cost:.4f} - latency {latency:.2f}s{byte_part}")
+
+
+def _collapsed_label(collapsed: list) -> tuple[str, str]:
+    """Return (label, css_class) for a collapsed retry range."""
+    count = len(collapsed)
+    cost = sum(float(r["cost_dollars"] or 0.0) for r in collapsed)
+    latency = sum(float(r["latency_seconds"] or 0.0) for r in collapsed)
+    all_failed = all(r["status"] != "success" for r in collapsed)
+    status = "all FAILED" if all_failed else "mixed"
+    label = (f"↻ {count} collapsed retries - {status}<br/>"
+             f"cost ${cost:.4f} - latency {latency:.2f}s")
+    cls = "failure" if all_failed else "success"
+    return (label, cls)
+
+
+def _append_step_node(lines: list[str], prev: str, node: str, row) -> str:
+    lines.append(f'        {node}["{_step_label(row)}"]')
+    if row["attempt"] > 1:
+        lines.append(f"        {prev} -->|retry| {node}")
+    else:
+        lines.append(f"        {prev} --> {node}")
+    lines.append(f"        class {node} "
+                 f"{'success' if row['status'] == 'success' else 'failure'}")
+    return node
 
 
 def build_mermaid(traces: list[dict]) -> str:
@@ -143,16 +205,21 @@ def build_mermaid(traces: list[dict]) -> str:
         lines.append(f'    subgraph T{tag}["Trace {trace["label"]} - {verdict}"]')
         lines.append(f'        S{tag}(["Start"])')
         prev = f"S{tag}"
-        for i, row in enumerate(trace["steps"]):
-            node = f"T{tag}S{i + 1}"
-            lines.append(f'        {node}["{_step_label(row)}"]')
-            if row["attempt"] > 1:
-                lines.append(f"        {prev} -->|retry| {node}")
-            else:
-                lines.append(f"        {prev} --> {node}")
-            lines.append(f"        class {node} "
-                         f"{'success' if row['status'] == 'success' else 'failure'}")
-            prev = node
+        steps = trace["steps"]
+        if len(steps) > MAX_DETAIL_STEPS:
+            for i, row in enumerate(steps[:2]):
+                prev = _append_step_node(lines, prev, f"T{tag}S{i + 1}", row)
+            collapsed = steps[2:-1]
+            coll_label, coll_class = _collapsed_label(collapsed)
+            coll_node = f"T{tag}C"
+            lines.append(f'        {coll_node}["{coll_label}"]')
+            lines.append(f"        {prev} -->|retry| {coll_node}")
+            lines.append(f"        class {coll_node} {coll_class}")
+            prev = coll_node
+            prev = _append_step_node(lines, prev, f"T{tag}S{len(steps)}", steps[-1])
+        else:
+            for i, row in enumerate(steps):
+                prev = _append_step_node(lines, prev, f"T{tag}S{i + 1}", row)
         end = f"E{tag}"
         end_text = ("Succeeded" if verdict in
                     ("CLEAN SUCCESS", "RETRIED THEN SUCCEEDED")
@@ -172,9 +239,10 @@ def render_markdown(rows: list[sqlite3.Row], traces: list[dict]) -> str:
     out = [
         "# Trace diagram - M1 demo traces",
         "",
-        "Generated by `visualizer.py` (version 1) from the M1 attempts "
+        "Generated by `visualizer.py` (version 2) from the M1 attempts "
         "database, demo traffic only (local HTTP test server on loopback). "
-        "Metadata only: no secrets or request/response bodies are included.",
+        "Metadata only: no secrets, argument values, or request/response "
+        "bodies are included.",
         "",
         "## Headline numbers",
         "",
@@ -193,14 +261,18 @@ def render_markdown(rows: list[sqlite3.Row], traces: list[dict]) -> str:
         "## How to read the diagram",
         "",
         "- Each box group is one trace (one task), labelled Trace A, "
-        "Trace B, Trace C, ... in the order the traces first appear.",
+        "Trace B, Trace C, ... sorted by trace ID so Trace A is always first.",
         "- Each box inside a group is one attempt, in order. Follow the "
         "arrows from Start to the finish flag.",
         "- Green SUCCESS = the attempt succeeded. Red FAILED = it failed.",
         "- An arrow marked `retry` plus a repeated attempt box means the "
         "same task was tried again. More boxes = more retries spent.",
-        "- Every attempt box shows its cost and latency, plus the HTTP "
-        "status when recorded.",
+        "- Long traces (more than 5 attempts) collapse middle retries "
+        "into one summary box to save space; the verdict table still "
+        "shows true attempt counts.",
+        "- Every attempt box shows method, endpoint path, HTTP status, "
+        "cost, latency, and bytes in/out. Query arguments are counted "
+        "but never shown; POST bodies are never shown.",
         "- The finish flag states the verdict: clean success (one try), "
         "retried then succeeded, or wasted (retries spent, never succeeded).",
         "",
@@ -254,7 +326,7 @@ def seed_demo(conn: sqlite3.Connection) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Visualizer v1: attempts.db -> trace-diagram.md")
+    parser = argparse.ArgumentParser(description="Visualizer v2: attempts.db -> trace-diagram.md")
     parser.add_argument("--db", default="attempts.db")
     parser.add_argument("--output", default="trace-diagram.md")
     parser.add_argument("--seed-demo", action="store_true",
