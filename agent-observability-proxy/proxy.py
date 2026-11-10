@@ -137,16 +137,28 @@ class ProxyState:
             return True
 
     def task_number(self, trace_id: str, explicit: str | None) -> int:
-        if explicit:
-            try:
-                return int(explicit)
-            except ValueError:
-                pass
+        # One trace keeps one number: the first claim wins. An explicit
+        # number taken by another trace falls back to auto-assignment,
+        # and a fresh explicit number pushes the auto counter past it,
+        # so explicit and auto numbers can never collide.
         with self._lock:
-            if trace_id not in self._task_by_trace:
-                self._task_by_trace[trace_id] = self._next_task
-                self._next_task += 1
-            return self._task_by_trace[trace_id]
+            if trace_id in self._task_by_trace:
+                return self._task_by_trace[trace_id]
+            if explicit:
+                try:
+                    number = int(explicit)
+                except ValueError:
+                    pass
+                else:
+                    if number not in self._task_by_trace.values():
+                        self._task_by_trace[trace_id] = number
+                        if number >= self._next_task:
+                            self._next_task = number + 1
+                        return number
+            number = self._next_task
+            self._next_task += 1
+            self._task_by_trace[trace_id] = number
+            return number
 
     def next_attempt(self, trace_id: str, endpoint: str, method: str) -> int:
         # Retry grouping: same trace_id + endpoint + method in window.

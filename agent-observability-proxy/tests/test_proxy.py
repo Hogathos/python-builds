@@ -210,5 +210,22 @@ class M1ProxyTest(unittest.TestCase):
     # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
 
+class TaskNumberReconciliationTest(unittest.TestCase):
+    def test_duplicate_explicit_numbers_are_distinguished(self):
+        tmp = tempfile.TemporaryDirectory()
+        state = proxy_module.ProxyState(os.path.join(tmp.name, "tasks.db"))
+        try:
+            first = state.task_number("trace-explicit-a", "5")
+            second = state.task_number("trace-explicit-b", "5")
+            auto = state.task_number("trace-auto-c", None)
+            self.assertEqual(first, 5)
+            self.assertEqual(second, 6)
+            self.assertEqual(auto, 7)
+            self.assertEqual(state.task_number("trace-explicit-a", "5"), 5)
+        finally:
+            state.conn.close()
+            tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
