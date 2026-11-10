@@ -422,8 +422,11 @@ def make_handler(state: ProxyState):
 
             headers = {}
             for key, value in self.headers.items():
-                if key.lower() in HOP_BY_HOP or key.lower() == "host":
+                lowered = key.lower()
+                if lowered in HOP_BY_HOP or lowered == "host":
                     continue
+                if lowered in ("x-task-number", "x-strategy"):
+                    continue  # proxy control headers: used locally, never forwarded
                 headers[key] = value  # forwarded, never logged
             headers["Host"] = dest_label
             headers["X-Trace-Id"] = trace_id

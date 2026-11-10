@@ -16,6 +16,23 @@ import proxy as proxy_module
 import server as server_module
 
 
+class _HeaderEchoHandler(server_module.Handler):
+    """Upstream that echoes received header NAMES only, never values."""
+
+    def _handle(self):
+        names = sorted({key.lower() for key in self.headers})
+        body = json.dumps({"received_headers": names}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # Handler binds do_GET/do_POST to its own _handle, so rebind here.
+    do_GET = _handle
+    do_POST = _handle
+
+
 class M1ProxyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -166,6 +183,29 @@ class M1ProxyTest(unittest.TestCase):
         self.assertEqual([r["method"] for r in mine], ["GET", "POST", "GET"])
         self.assertEqual([r["attempt"] for r in mine], [1, 1, 2])
         self.assertEqual(mine[2]["retry_reason"], "retry")
+
+    def test_control_headers_stripped_but_trace_forwarded(self):
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _HeaderEchoHandler)
+        port = upstream.server_address[1]
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/headers")
+            req.add_header("X-Trace-Id", "trace-headers-t7")
+            req.add_header("X-Task-Number", "7")
+            req.add_header("X-Strategy", "test-strategy")
+            with self.opener.open(req, timeout=10) as resp:
+                self.assertEqual(resp.status, 200)
+                payload = json.loads(resp.read())
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+        names = payload["received_headers"]
+        self.assertIn("x-trace-id", names)
+        self.assertNotIn("x-task-number", names)
+        self.assertNotIn("x-strategy", names)
+        row = [r for r in self.rows() if r["trace_id"] == "trace-headers-t7"][0]
+        self.assertEqual(row["task_number"], 7)
+        self.assertEqual(row["strategy"], "test-strategy")
 
     # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
