@@ -49,10 +49,18 @@ def init_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)  # proxy logs from worker threads
     conn.execute(CREATE_TABLE_SQL)
     # M4 migration: add outcome/reason to a pre-M4 database in place.
+    # Two processes can arrive here together; if a peer wins the race
+    # the ALTER fails duplicate-column and the re-check below lets us
+    # continue. Anything else is re-raised, never masked.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
     for name in ("outcome", "reason"):
         if name not in existing:
-            conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            try:
+                conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
+                if name not in cols:
+                    raise
     conn.commit()
     return conn
 
