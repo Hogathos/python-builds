@@ -8,6 +8,10 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# urllib honors NO_PROXY and would bypass the loopback test proxy;
+# drop it so the suite never depends on ambient proxy config (N7).
+os.environ.pop("NO_PROXY", None); os.environ.pop("no_proxy", None)
+
 import db
 
 
