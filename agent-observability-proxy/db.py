@@ -132,39 +132,47 @@ def log_attempt(
 
 
 def fetch_totals(conn):
+    prev_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
-    return conn.execute(
-        """
-        SELECT COUNT(*) AS attempts,
-               COUNT(DISTINCT trace_id) AS traces,
-               SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
-               SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
-               ROUND(AVG(latency_seconds), 4) AS avg_latency_seconds,
-               SUM(bytes_in) AS bytes_in,
-               SUM(bytes_out) AS bytes_out,
-               SUM(input_tokens) AS input_tokens,
-               ROUND(SUM(cost_dollars), 6) AS cost_dollars
-        FROM attempts
-        """
-    ).fetchone()
+    try:
+        return conn.execute(
+            """
+            SELECT COUNT(*) AS attempts,
+                   COUNT(DISTINCT trace_id) AS traces,
+                   SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
+                   ROUND(AVG(latency_seconds), 4) AS avg_latency_seconds,
+                   SUM(bytes_in) AS bytes_in,
+                   SUM(bytes_out) AS bytes_out,
+                   SUM(input_tokens) AS input_tokens,
+                   ROUND(SUM(cost_dollars), 6) AS cost_dollars
+            FROM attempts
+            """
+        ).fetchone()
+    finally:
+        conn.row_factory = prev_factory
 
 
 def fetch_report(conn):
+    prev_factory = conn.row_factory
     conn.row_factory = sqlite3.Row
-    return conn.execute(
-        """
-        SELECT dest_host, endpoint, method,
-               COUNT(*) AS attempts,
-               SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
-               SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
-               ROUND(AVG(latency_seconds), 4) AS avg_latency_seconds,
-               SUM(bytes_in) AS bytes_in,
-               SUM(bytes_out) AS bytes_out
-        FROM attempts
-        GROUP BY dest_host, endpoint, method
-        ORDER BY attempts DESC, dest_host, endpoint
-        """
-    ).fetchall()
+    try:
+        return conn.execute(
+            """
+            SELECT dest_host, endpoint, method,
+                   COUNT(*) AS attempts,
+                   SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
+                   ROUND(AVG(latency_seconds), 4) AS avg_latency_seconds,
+                   SUM(bytes_in) AS bytes_in,
+                   SUM(bytes_out) AS bytes_out
+            FROM attempts
+            GROUP BY dest_host, endpoint, method
+            ORDER BY attempts DESC, dest_host, endpoint
+            """
+        ).fetchall()
+    finally:
+        conn.row_factory = prev_factory
 
 
 def fetch_outcome_counts(conn) -> dict:

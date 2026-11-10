@@ -133,5 +133,21 @@ class ConcurrentLogAttemptTest(unittest.TestCase):
             db._write_lock = real_lock
 
 
+class FetchHelpersDoNotMutateConnectionTest(unittest.TestCase):
+    def test_row_factory_restored_after_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = db.init_db(os.path.join(tmp, "attempts.db"))
+            db.log_attempt(conn, trace_id="t", task_number=1,
+                           attempt=1, status="success")
+            self.assertIsNone(conn.row_factory)
+            totals = db.fetch_totals(conn)
+            self.assertIsNone(conn.row_factory)
+            self.assertEqual(totals["attempts"], 1)
+            report = db.fetch_report(conn)
+            self.assertIsNone(conn.row_factory)
+            self.assertEqual(len(report), 1)
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

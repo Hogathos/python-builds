@@ -74,6 +74,11 @@ def _usage_input_tokens(body: bytes, content_type: str) -> int:
     return 0
 
 
+def _retry_reason(attempt: int) -> str:
+    """Retry marker for a log row: 'retry' unless this is attempt 1."""
+    return "retry" if attempt > 1 else ""
+
+
 class ProxyState:
     def __init__(self, db_path: str, retry_window: float = 10.0,
                  allowlist=None, rate_limit: int = RATE_LIMIT,
@@ -127,13 +132,11 @@ class ProxyState:
         """Sliding window per destination; True = this request may pass."""
         now = time.time()
         with self._lock:
-            stamps = [s for s in self._rate_stamps.get(dest_label, [])
-                      if now - s <= self.rate_window]
+            stamps = self._rate_stamps.setdefault(dest_label, [])
+            stamps[:] = [s for s in stamps if now - s <= self.rate_window]
             if len(stamps) >= self.rate_limit:
-                self._rate_stamps[dest_label] = stamps
                 return False
             stamps.append(now)
-            self._rate_stamps[dest_label] = stamps
             return True
 
     def task_number(self, trace_id: str, explicit: str | None) -> int:
@@ -243,30 +246,22 @@ def make_handler(state: ProxyState):
                 trace_id, self.headers.get("X-Task-Number"))
             strategy = self.headers.get("X-Strategy") or "proxy"
 
-            def log_tunnel(status, bytes_in, bytes_out):
+            def log_connect(status, outcome, reason, http_status,
+                            bytes_in, bytes_out):
                 db_module.log_attempt(
                     state.conn, trace_id=trace_id,
                     task_number=task_number, attempt=attempt,
                     strategy=strategy, status=status,
                     latency_seconds=time.perf_counter() - start,
-                    retry_reason="retry" if attempt > 1 else "",
+                    retry_reason=_retry_reason(attempt),
                     dest_host=endpoint, endpoint=endpoint,
                     method="CONNECT", bytes_in=bytes_in,
-                    bytes_out=bytes_out, http_status=None,
-                    outcome="allowed", reason="")
+                    bytes_out=bytes_out, http_status=http_status,
+                    outcome=outcome, reason=reason)
 
             if not state.is_allowed(dest_host, dest_port):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
-                db_module.log_attempt(
-                    state.conn, trace_id=trace_id,
-                    task_number=task_number, attempt=attempt,
-                    strategy=strategy, status="blocked",
-                    latency_seconds=time.perf_counter() - start,
-                    retry_reason="retry" if attempt > 1 else "",
-                    dest_host=endpoint, endpoint=endpoint,
-                    method="CONNECT", bytes_in=0, bytes_out=0,
-                    http_status=403, outcome="blocked",
-                    reason="not_allowlisted")
+                log_connect("blocked", "blocked", "not_allowlisted", 403, 0, 0)
                 self.send_response(403)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
@@ -274,16 +269,8 @@ def make_handler(state: ProxyState):
                 return
             if not state.check_rate(endpoint):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
-                db_module.log_attempt(
-                    state.conn, trace_id=trace_id,
-                    task_number=task_number, attempt=attempt,
-                    strategy=strategy, status="rate_limited",
-                    latency_seconds=time.perf_counter() - start,
-                    retry_reason="retry" if attempt > 1 else "",
-                    dest_host=endpoint, endpoint=endpoint,
-                    method="CONNECT", bytes_in=0, bytes_out=0,
-                    http_status=429, outcome="rate_limited",
-                    reason="rate_limited")
+                log_connect("rate_limited", "rate_limited", "rate_limited",
+                            429, 0, 0)
                 self.send_response(429)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
@@ -301,7 +288,7 @@ def make_handler(state: ProxyState):
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                log_tunnel("failure", 0, 0)
+                log_connect("failure", "allowed", "", None, 0, 0)
                 return
 
             self.send_response(200)
@@ -320,7 +307,7 @@ def make_handler(state: ProxyState):
                 status = "failure"
             finally:
                 upstream.close()
-            log_tunnel(status, bytes_in, bytes_out)
+            log_connect(status, "allowed", "", None, bytes_in, bytes_out)
 
         def _target(self):
             """Return (host, port, endpoint), None if unsupported.
@@ -356,7 +343,7 @@ def make_handler(state: ProxyState):
                 task_number=task_number, attempt=attempt,
                 strategy=strategy, status="failure",
                 latency_seconds=time.perf_counter() - start,
-                retry_reason="retry" if attempt > 1 else "",
+                retry_reason=_retry_reason(attempt),
                 dest_host=self.headers.get("Host") or "",
                 endpoint=self.path,
                 method=self.command, bytes_in=0, bytes_out=0,
@@ -402,7 +389,7 @@ def make_handler(state: ProxyState):
                     task_number=task_number, attempt=attempt,
                     strategy=strategy, status=status,
                     latency_seconds=time.perf_counter() - start,
-                    retry_reason="retry" if attempt > 1 else "",
+                    retry_reason=_retry_reason(attempt),
                     dest_host=dest_label, endpoint=endpoint,
                     method=self.command, bytes_in=0, bytes_out=0,
                     http_status=code, outcome=status, reason=reason)
@@ -472,7 +459,7 @@ def make_handler(state: ProxyState):
                 latency_seconds=latency,
                 input_tokens=input_tokens,
                 cost_dollars=0.0,
-                retry_reason="retry" if attempt > 1 else "",
+                retry_reason=_retry_reason(attempt),
                 dest_host=dest_label,
                 endpoint=endpoint,
                 method=self.command,
