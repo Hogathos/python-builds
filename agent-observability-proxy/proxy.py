@@ -348,7 +348,7 @@ def make_handler(state: ProxyState):
             """400 plus an audit row for an unparseable destination."""
             task_number = state.task_number(
                 trace_id, self.headers.get("X-Task-Number"))
-            attempt = state.next_attempt(trace_id, self.path, self.command)
+            attempt = state.peek_attempt(trace_id, self.path, self.command)
             strategy = self.headers.get("X-Strategy") or "proxy"
             body = b"failure: request not forwarded by proxy\n"
             db_module.log_attempt(
@@ -423,13 +423,14 @@ def make_handler(state: ProxyState):
                 reject(429, "rate_limited", "rate_limited")
                 return
 
-            # Numbered only once the request will actually be forwarded.
-            attempt = state.next_attempt(trace_id, endpoint, self.command)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
+                attempt = state.peek_attempt(trace_id, endpoint, self.command)
                 reject(400, "failure", "malformed_header")
                 return
+            # Numbered only once the request will actually be forwarded.
+            attempt = state.next_attempt(trace_id, endpoint, self.command)
             request_body = self.rfile.read(length) if length else b""
 
             headers = {}

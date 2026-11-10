@@ -211,6 +211,36 @@ class M1ProxyTest(unittest.TestCase):
         self.assertEqual(row["task_number"], 7)
         self.assertEqual(row["strategy"], "test-strategy")
 
+    def test_malformed_then_allowed_logs_attempts_1_1(self):
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("GET", f"{self.base}/echo",
+                     headers={"Content-Length": "abc",
+                              "X-Trace-Id": "trace-malformed-peek-cl"})
+        self.assertEqual(conn.getresponse().status, 400)
+        conn.close()
+        self.assertEqual(
+            self.get("/echo", trace="trace-malformed-peek-cl")[0], 200)
+        mine = [r for r in self.rows()
+                if r["trace_id"] == "trace-malformed-peek-cl"]
+        self.assertEqual([r["status"] for r in mine], ["failure", "success"])
+        self.assertEqual([r["attempt"] for r in mine], [1, 1])
+
+        conn2 = http.client.HTTPConnection(
+            "127.0.0.1", self.proxy_port, timeout=10)
+        conn2.putrequest("GET", "/echo", skip_host=1)
+        conn2.putheader("Host", "127.0.0.1:abc")
+        conn2.putheader("X-Trace-Id", "trace-malformed-peek-host")
+        conn2.endheaders()
+        self.assertEqual(conn2.getresponse().status, 400)
+        conn2.close()
+        self.assertEqual(
+            self.get("/echo", trace="trace-malformed-peek-host")[0], 200)
+        mine2 = [r for r in self.rows()
+                 if r["trace_id"] == "trace-malformed-peek-host"]
+        self.assertEqual([r["status"] for r in mine2], ["failure", "success"])
+        self.assertEqual([r["attempt"] for r in mine2], [1, 1])
+
     # CONNECT tunnelling (M2) is covered in tests/test_connect.py.
 
 
