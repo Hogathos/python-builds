@@ -1,81 +1,32 @@
 # Agent Observability Proxy
 
-Local proxy in the middle of agent traffic, so the log is real traffic.
-Built milestone by milestone from the 2026-11-01 proxy sketch.
+Local proxy that watches agent traffic and logs what happened, metadata only.
 
-## Status: M4 (awaiting approval)
+- Traces requests across agent legs with one `X-Trace-Id`.
+- Blocks non-allowlisted destinations (403, never forwarded).
+- Rate-limits hot destinations (429, recovers after the window).
 
-M1 is a plain-HTTP forwarding proxy to a local test server with
-metadata-only SQLite logging. M2 adds CONNECT tunnelling: the proxy
-accepts `CONNECT host:port`, opens a raw TCP tunnel, and relays bytes
-both ways so HTTPS traffic can pass through. The tunnel is never
-decrypted (no TLS interception, no MITM), and only metadata is logged
-per tunnel: destination host:port, method CONNECT, success/failure,
-latency, bytes in/out, and the trace ID (carried on the CONNECT
-request, or generated and returned in the `X-Trace-Id` response
-header). Payload content, headers, and keys are never logged.
-M3 adds the two-agent trace demo: Agent A calls Agent B through the
-proxy, and Agent B calls the upstream test server through the proxy
-again, with one `X-Trace-Id` carried across both legs. If A sends no
-trace ID, the proxy generates one on the first leg, returns it, and
-that same ID is forwarded to B and carried on B's downstream call.
-Every attempt from both legs is logged under that one trace_id, with
-dest_host / endpoint distinguishing the A leg (Agent B's /task) from
-the B leg (upstream /echo). Run it with `python demo_two_agents.py`
-or the tests in `tests/test_trace_propagation.py`; Agent B standalone
-is `python agent_b.py --port 18081`.
+**Never logs request/response bodies, API keys, or header values.** No TLS interception, no MITM.
 
-M4 adds the allowlist and rate limit. Only destinations on the
-configurable allowlist are forwarded (default local test hosts
-`127.0.0.1`, `localhost`, `::1`; change with `--allowlist` or
-`serve(..., allowlist=...)`). A non-allowlisted destination is
-blocked at the proxy and never forwarded: HTTP gets 403, a CONNECT
-tunnel is never opened, and the attempt is logged `outcome=blocked`,
-`reason=not_allowlisted`. More than the configured rate limit
-(`--rate-limit`, default 100 per `--rate-window` 10s, per
-destination) gets 429 and is logged `outcome=rate_limited`,
-`reason=rate_limited`; after the window passes, requests pass again.
-Forwarded attempts log `outcome=allowed`. The two new columns are
-the only logging change; M1/M2/M3 fields and trace propagation are
-unchanged. Run the demo with `python demo_m4.py`; `report.py` now
-prints allowed / blocked / rate_limited counts next to the headline
-metrics.
+Status: M4 + visualizer v2 + T1–T9 fixes. Suite 35/35.
 
-## Schema note (why db.py differs from raw v0.3)
-
-The v0.3 `attempts` table is reused in the same `attempts.db` file —
-all 11 original columns verbatim. Logging destination host,
-endpoint/method, and bytes in/out (required by the sketch) has no
-column to go into in v0.3, so `db.py` appends only those fields:
-`dest_host`, `endpoint`, `method`, `bytes_in`, `bytes_out`, plus
-`http_status` so the numeric code survives alongside the
-success/failure `status`. Existing v0.3 databases are migrated in
-place with `ALTER TABLE`. No new database, no other schema change.
-
-`input_tokens` is recorded only when the upstream JSON response itself
-reports `usage`; `cost_dollars` stays 0.0 — never invented.
-Authorization headers, API keys, and request/response bodies are
-forwarded but never logged.
-
-## Run M1
+## Quick start
 
 ```powershell
 python server.py --port 18080        # terminal 1: local test server
 python proxy.py --port 8888          # terminal 2: proxy on 127.0.0.1:8888
 python client.py                     # terminal 3: demo traffic via proxy
-python report.py --db attempts.db    # GROUP BY headline metrics
+python report.py --db attempts.db    # headline metrics
 ```
-
-Or point any tool at it: `HTTP_PROXY=http://127.0.0.1:8888`.
-
-Trace ID: an incoming `X-Trace-Id` is forwarded unchanged; otherwise
-the proxy generates one, adds it upstream, and returns it in the
-`X-Trace-Id` response header. Repeats of the same trace + endpoint +
-method inside 10 s are logged as attempt 2, 3, ... with
-`retry_reason='retry'`.
 
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v   # 35 tests
 ```
+
+## Docs
+
+- [Architecture](docs/architecture.md): M1–M4, trace propagation, schema.
+- [Running the demos](docs/running.md): two-agent, M4, visualizer commands.
+- [Trace diagram](trace-diagram.md): latest demo output (headline + Mermaid).
