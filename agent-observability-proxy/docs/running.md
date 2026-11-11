@@ -13,6 +13,22 @@ python report.py --db attempts.db    # GROUP BY headline metrics
 
 Or point any tool at it: `HTTP_PROXY=http://127.0.0.1:8888`.
 
+## CONNECT idle timeout (`--relay-timeout`)
+
+```powershell
+python proxy.py --port 8888 --relay-timeout 300   # long-idle tunnels
+```
+
+`--relay-timeout <seconds>` (float, default `30.0`) is how long a CONNECT
+tunnel may stay silent — no bytes in either direction — before the proxy
+closes it and logs it as a failure. Any byte resets the silence clock, so
+busy tunnels are unaffected. Raise it when an upstream turn legitimately
+goes quiet for longer than 30 s before answering, e.g. a long grounded
+search or slow model turn that sends nothing while it works: `300` gives
+such a turn five minutes of silence instead of killing it mid-turn at 30 s.
+Lower it only to reap dead tunnels sooner. The default preserves the
+original 30 s behaviour.
+
 ## M3: two-agent trace
 
 ```powershell
@@ -37,7 +53,7 @@ python visualizer.py --db attempts.db --output trace-diagram.md --seed-demo
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests -v   # 35 tests
+python -m unittest discover -s tests -v   # 36 tests
 ```
 
 ## Load testing

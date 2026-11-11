@@ -173,6 +173,76 @@ class M2ConnectTest(unittest.TestCase):
             proxy.state.conn.close()
             tmp.cleanup()
 
+    def test_tunnel_idle_under_configured_relay_timeout_survives_and_forwards(self):
+        configured_relay_timeout_seconds = 2.0
+        idle_duration_seconds = 1.0
+        payload_sent_after_idle = b"payload-sent-after-idle-period"
+        temporary_directory = tempfile.TemporaryDirectory()
+        database_path = os.path.join(
+            temporary_directory.name, "idle-under-relay-timeout.db")
+        proxy_with_configured_relay_timeout = proxy_module.serve(
+            "127.0.0.1", 0, database_path,
+            relay_timeout=configured_relay_timeout_seconds)
+        self.assertEqual(
+            proxy_with_configured_relay_timeout.state.relay_timeout,
+            configured_relay_timeout_seconds)
+        proxy_port_with_configured_relay_timeout = (
+            proxy_with_configured_relay_timeout.server_address[1])
+        threading.Thread(
+            target=proxy_with_configured_relay_timeout.serve_forever,
+            daemon=True).start()
+        try:
+            tunnel_socket = socket.create_connection(
+                ("127.0.0.1", proxy_port_with_configured_relay_timeout),
+                timeout=5)
+            tunnel_socket.sendall(
+                f"CONNECT {self.dest} HTTP/1.1\r\nHost: {self.dest}\r\n"
+                "X-Trace-Id: trace-idle-under-relay-timeout\r\n\r\n".encode())
+            response_head = b""
+            while b"\r\n\r\n" not in response_head:
+                response_chunk = tunnel_socket.recv(65536)
+                self.assertTrue(response_chunk)
+                response_head += response_chunk
+            self.assertEqual(
+                int(response_head.split(b"\r\n", 1)[0].split()[1]), 200)
+            # Idle for less than the configured timeout: the tunnel must
+            # still be open afterwards, and must still forward bytes.
+            time.sleep(idle_duration_seconds)
+            tunnel_socket.sendall(payload_sent_after_idle)
+            received_after_idle = b""
+            while len(received_after_idle) < len(payload_sent_after_idle):
+                received_chunk = tunnel_socket.recv(65536)
+                self.assertTrue(received_chunk)
+                received_after_idle += received_chunk
+            self.assertEqual(received_after_idle, payload_sent_after_idle)
+            tunnel_socket.close()
+            logged_row = None
+            for _ in range(50):
+                connection = sqlite3.connect(database_path)
+                connection.row_factory = sqlite3.Row
+                matching_rows = [
+                    row for row in connection.execute(
+                        "SELECT * FROM attempts")
+                    if row["trace_id"] == "trace-idle-under-relay-timeout"]
+                connection.close()
+                if matching_rows:
+                    logged_row = matching_rows[-1]
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(logged_row)
+            self.assertEqual(logged_row["status"], "success")
+            self.assertGreaterEqual(
+                logged_row["bytes_in"], len(payload_sent_after_idle))
+            self.assertGreaterEqual(
+                logged_row["bytes_out"], len(payload_sent_after_idle))
+            self.assertGreaterEqual(
+                logged_row["latency_seconds"], idle_duration_seconds)
+        finally:
+            proxy_with_configured_relay_timeout.shutdown()
+            proxy_with_configured_relay_timeout.server_close()
+            proxy_with_configured_relay_timeout.state.conn.close()
+            temporary_directory.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

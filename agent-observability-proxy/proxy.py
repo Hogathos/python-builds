@@ -516,10 +516,15 @@ def main():
     parser.add_argument("--rate-limit", type=int, default=RATE_LIMIT)
     parser.add_argument("--rate-window", type=float,
                         default=RATE_WINDOW_SECONDS)
+    parser.add_argument("--relay-timeout", type=float,
+                        default=RELAY_IDLE_TIMEOUT_SECONDS,
+                        help="seconds of CONNECT tunnel silence before "
+                             "the relay gives up (default 30)")
     args = parser.parse_args()
     server = serve(args.host, args.port, args.db,
                    allowlist=args.allowlist.split(","),
-                   rate_limit=args.rate_limit, rate_window=args.rate_window)
+                   rate_limit=args.rate_limit, rate_window=args.rate_window,
+                   relay_timeout=args.relay_timeout)
     print(f"proxy listening on {args.host}:{args.port} db={args.db}")
     try:
         server.serve_forever()
