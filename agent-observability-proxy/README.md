@@ -8,7 +8,7 @@ Local proxy that watches agent traffic and logs what happened, metadata only.
 
 **Never logs request/response bodies, API keys, or header values.** No TLS interception, no MITM.
 
-Status: M4 + visualizer v2 + T1–T9 fixes. Suite 35/35.
+Status: M4 + visualizer v2 + T1–T9 fixes. Suite 36/36.
 
 ## Quick start
 
