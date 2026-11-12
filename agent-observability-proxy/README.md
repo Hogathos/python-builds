@@ -22,7 +22,7 @@ python report.py --db attempts.db    # headline metrics
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests -v   # 35 tests
+python -m unittest discover -s tests -v   # 36 tests
 ```
 
 ## Docs
@@ -30,3 +30,19 @@ python -m unittest discover -s tests -v   # 35 tests
 - [Architecture](docs/architecture.md): M1–M4, trace propagation, schema.
 - [Running the demos](docs/running.md): two-agent, M4, visualizer commands.
 - [Trace diagram](trace-diagram.md): latest demo output (headline + Mermaid).
+
+## Handoff
+
+How to run it:
+
+```powershell
+python proxy.py --port 8888 --db attempts.db --allowlist 127.0.0.1,localhost,::1 --rate-limit 100 --rate-window 10 --relay-timeout 30
+```
+
+Defaults: port 8888, db attempts.db, allowlist `127.0.0.1,localhost,::1`, rate limit 100 per 10 s, relay timeout 30.0 s (see `proxy.py` argument defaults). Point a tool at it with `HTTP_PROXY=http://127.0.0.1:8888`.
+
+How to read a trace: `python report.py --db attempts.db` (see `report.py`): one SQLite row per attempt, metadata only — trace_id, destination, method, status, latency, bytes in/out, outcome, attempt number. Never prompts, bodies, keys, or Authorization headers.
+
+What it can't see: TLS is opaque — a CONNECT tunnel logs destination / timing / size only, no decrypted payload, no per-request detail inside a tunnel. No priced cost — tokens 0, cost $0.0000 measured, no usage signal through a tunnel.
+
+Evidence: suite 36/36; Locust 37.1 req/s with 0 failures in 1427; dogfood Day 1 3/3; Day 2 12 attempts / 5 success; kill-switch passed fail-closed; eval report + golden dataset v2 in `evals`, commits 7e39e2c and e4fca47.
