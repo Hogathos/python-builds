@@ -1,0 +1,93 @@
+{
+  "manifest": {
+    "dataset_version": "v2",
+    "version": "1.0",
+    "date": "2026-11-11",
+    "source": "Real traces only: dogfood.db, dogfood-day1.db, dogfood-day2.db, kill-switch-test.db in agent-observability-proxy (this checkout). No seeded-demo data; nothing from trace-diagram.md.",
+    "how_to_run": "Re-query the source DB file named in each case's scenario (read-only sqlite3 against the row_ids listed); compare with expected. Case-level detail in evals/eval-report-draft.md section 2.",
+    "versioning_rule": "v1 (11 seeded-demo cases, 8 categories) is frozen and untouched. v2 changelog: all cases re-sourced from real proxy traces; outcome splits the proxy recorded (allowed/blocked) vs turn results (success/failure); cause labels beyond the rows are marked user-supplied with date.",
+    "scope": "Real CONNECT metadata rows only (ids, outcome, status, latency, byte counts). No bodies, keys, or header values. input_tokens/cost_dollars are measured zero (no usage signal through tunnels), never priced. Heartbeat rows are recorded but excluded from task evidence."
+  },
+  "cases": [
+    {
+      "id": "dogfood-block-connect",
+      "milestone": "Dogfood",
+      "category": "M4 allowlist block",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood.db", "row_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "method": "CONNECT", "destination": "api.meta.ai:443", "allowlist": "destination not allowlisted at the time"},
+      "expected": {"rows": 13, "outcome": "blocked", "reason": "not_allowlisted", "row_status": "blocked", "http_status": 403, "bytes_in_total": 0, "bytes_out_total": 0, "zero_forwarded_bytes": true},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "dogfood-allowed-tunnel",
+      "milestone": "Dogfood",
+      "category": "M2 CONNECT",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood.db", "row_ids": [14, 15, 16, 17, 18, 19, 20], "method": "CONNECT", "destination": "api.meta.ai:443"},
+      "expected": {"rows": 7, "outcome": "allowed", "row_status": "success", "bytes_in_total": 1813918, "bytes_out_total": 2816822, "bytes_nonzero": true, "input_tokens": 0, "cost_dollars": 0.0},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "dogfood-accounting",
+      "milestone": "Dogfood",
+      "category": "M4 outcome accounting",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood.db", "row_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]},
+      "expected": {"rows": 20, "outcome_counts": {"allowed": 7, "blocked": 13, "rate_limited": 0, "other": 0}, "outcome_sum_equals_attempts": true},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "day1-three-success",
+      "milestone": "Dogfood",
+      "category": "M2 CONNECT",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood-day1.db", "row_ids": [1, 2, 3], "method": "CONNECT", "destination": "api.meta.ai:443", "note": "Nov 9, 15:41 / 19:01 / 23:01 EST"},
+      "expected": {"rows": 3, "outcome": "allowed", "row_status": "success", "success_rate": 1.0, "avg_latency_seconds": 23.6372, "bytes_in_total": 5180, "bytes_out_total": 38691, "input_tokens": 0, "cost_dollars": 0.0},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "day1-heartbeat-excluded",
+      "milestone": "Dogfood",
+      "category": "Heartbeat excluded",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood-day1.db", "row_ids": [24, 25, 26, 27], "method": "CONNECT", "destination": "api.meta.ai:443", "note": "Nov 10, 03:01 / 07:01 / 11:01 / 15:01 EST, about every 4 hours; periodic keepalive, not task evidence"},
+      "expected": {"rows": 4, "row_status": "success", "excluded_from_day1": true, "bytes_in_each": 658, "bytes_out_each_about": 4710, "latency_range_seconds": [0.18, 0.31]},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "day2-twelve-mixed",
+      "milestone": "Dogfood",
+      "category": "Mixed turns",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood-day2.db", "row_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], "method": "CONNECT", "destination": "api.meta.ai:443", "success_row_ids": [1, 2, 5, 6, 7], "failure_row_ids": [3, 4, 8, 9, 10, 11, 12]},
+      "expected": {"rows": 12, "outcome_counts": {"allowed": 12, "blocked": 0, "rate_limited": 0, "other": 0}, "status_success": 5, "status_failure": 7, "not_a_clean_task_rate": true, "cause_split": "user-supplied Nov 11: success rows mix control traffic with real turns; failures are interrupted turns plus the idle-kill and uncharacterised cases below"},
+      "provenance": "real trace, not seeded; cause split user-supplied"
+    },
+    {
+      "id": "day2-idle-kill-3-8",
+      "milestone": "Dogfood",
+      "category": "Idle kill",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood-day2.db", "row_ids": [3, 8], "method": "CONNECT", "destination": "api.meta.ai:443"},
+      "expected": {"rows": 2, "row_status": "failure", "latency_seconds": {"3": 30.38, "8": 30.52}, "cause": "30 s idle kill, user-supplied Nov 11"},
+      "provenance": "real trace, not seeded; cause user-supplied"
+    },
+    {
+      "id": "day2-id11-uncharacterised",
+      "milestone": "Dogfood",
+      "category": "Uncharacterised failure",
+      "scenario": {"type": "recorded_rows", "source_db": "dogfood-day2.db", "row_ids": [11], "method": "CONNECT", "destination": "api.meta.ai:443"},
+      "expected": {"rows": 1, "row_status": "failure", "latency_seconds": 138.27, "bytes_in": 1518810, "bytes_out": 1895692, "cause": "uncharacterised; explicitly not an idle kill"},
+      "provenance": "real trace, not seeded"
+    },
+    {
+      "id": "killswitch-live-leg",
+      "milestone": "Kill-switch",
+      "category": "Fail closed",
+      "scenario": {"type": "recorded_rows", "source_db": "kill-switch-test.db", "row_ids": [1, 2], "method": "CONNECT", "destination": "api.meta.ai:443", "note": "proxy up on port 8888, allowlist 127.0.0.1 + localhost + ::1 + api.meta.ai, --relay-timeout 300; prompt 'say hi'"},
+      "expected": {"rows": 2, "outcome": "allowed", "row_status": "success", "success_rate": 1.0},
+      "provenance": "real trace, not seeded; run setup user-supplied"
+    },
+    {
+      "id": "killswitch-proxy-down",
+      "milestone": "Kill-switch",
+      "category": "Fail closed",
+      "scenario": {"type": "recorded_absence", "source_db": "kill-switch-test.db", "row_ids": [], "note": "proxy stopped; prompt 'hello again' failed with a transport error after 4 provider attempts (user-supplied Nov 10)"},
+      "expected": {"rows_total_still": 2, "new_rows": 0, "no_false_success_recorded": true},
+      "provenance": "real trace (absence of rows), not seeded; run account user-supplied"
+    }
+  ]
+}
