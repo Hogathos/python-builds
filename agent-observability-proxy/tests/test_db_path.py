@@ -5,6 +5,7 @@ create dist/attempts.db, hiding traffic from the dashboard.
 """
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -25,12 +26,12 @@ class DbDefaultPathTest(unittest.TestCase):
 
     def test_default_db_ignores_working_directory(self):
         here = os.path.abspath(os.getcwd())
-        tmp = os.path.join(here, "tmpabmgjizx")
-        os.chdir(tmp)
-        try:
-            args = proxy.build_parser().parse_args([])
-        finally:
-            os.chdir(here)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                args = proxy.build_parser().parse_args([])
+            finally:
+                os.chdir(here)
         self.assertEqual(args.db, os.path.join(PROXY_DIR, "attempts.db"))
 
     def test_frozen_exe_in_dist_uses_project_db(self):

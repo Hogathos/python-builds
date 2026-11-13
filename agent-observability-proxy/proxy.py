@@ -508,14 +508,29 @@ def serve(host: str = "127.0.0.1", port: int = 8888,
     return server
 
 
+def _is_windows_drive_path(path: str) -> bool:
+    """True for paths like C:/x or C:\\x, on any platform."""
+    return len(path) >= 3 and path[1] == ":" and path[0].isalpha() and path[2] in ("/", "\\")
+
+
 def _default_db_path() -> str:
     """Project-folder attempts.db, wherever the process was started from.
 
     Frozen exe inside dist/ -> the project folder above dist/.
     Frozen exe elsewhere -> beside the exe. Plain python -> beside proxy.py.
+    Windows drive paths (C:/...) count as absolute on every platform,
+    so POSIX CI never prefixes them with its working directory.
     """
     if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        exe = sys.executable
+        if _is_windows_drive_path(exe):
+            from pathlib import PureWindowsPath
+            exe_path = PureWindowsPath(exe)
+            exe_dir = exe_path.parent
+            if exe_dir.name.lower() == "dist":
+                return str(exe_dir.parent / "attempts.db")
+            return str(exe_dir / "attempts.db")
+        exe_dir = os.path.dirname(os.path.abspath(exe))
         if os.path.basename(exe_dir).lower() == "dist":
             return os.path.join(os.path.dirname(exe_dir), "attempts.db")
         return os.path.join(exe_dir, "attempts.db")

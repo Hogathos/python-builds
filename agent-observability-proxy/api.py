@@ -25,8 +25,82 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "attempts.db"),
 )
 
+# Price table: USD per forwarded request, keyed by destination host
+# (port stripped before lookup). Loopback is $0.00 because that traffic
+# never leaves the machine: no external API is called, so nothing can be
+# billed. Blocked and rate_limited attempts always cost $0.00 for the same
+# reason (never forwarded, zero bytes out). A nonzero cost already recorded
+# in the database (real API-reported usage) always wins over this table.
+# Any other destination is unknown: no price is guessed. Add a row here
+# only from a published vendor price page, and note the source.
+PRICE_PER_REQUEST = {
+    "127.0.0.1": 0.0,
+    "localhost": 0.0,
+    "::1": 0.0,
+}
+
+
+def attempt_cost(row) -> float | None:
+    """USD for one attempt row, or None when the price is unknown."""
+    if row["outcome"] in ("blocked", "rate_limited"):
+        return 0.0
+    if row["cost_dollars"]:
+        return row["cost_dollars"]
+    dest = row["dest_host"]
+    if dest in PRICE_PER_REQUEST:
+        return PRICE_PER_REQUEST[dest]
+    host, _, port = dest.rpartition(":")
+    if port.isdigit() and host and host in PRICE_PER_REQUEST:
+        return PRICE_PER_REQUEST[host]
+    return None
+
+
+def _money(value) -> str:
+    return "unknown" if value is None else f"${value:.2f}"
+
+
+def summarize_costs(attempts) -> dict:
+    """Cost rollup over attempt rows: total, wasted share, unknown dests.
+
+    Wasted = the priced share of attempts that were blocked, rate_limited,
+    or did not succeed. Totals stay None while any part is unpriced.
+    """
+    total = 0.0
+    wasted = 0.0
+    wasted_unknown = False
+    unknown_dests = set()
+    for a in attempts:
+        bad = a["outcome"] != "allowed" or a["status"] != "success"
+        c = attempt_cost(a)
+        if c is None:
+            unknown_dests.add(a["dest_host"])
+            if bad:
+                wasted_unknown = True
+            continue
+        total += c
+        if bad:
+            wasted += c
+    return {
+        "cost": None if unknown_dests else round(total, 2),
+        "wasted": None if wasted_unknown else round(wasted, 2),
+        "unknown_dests": sorted(unknown_dests),
+    }
+
+
+def run_cost_line(summary, subject="this run") -> str:
+    """Plain-words cost sentence for one run (or all runs)."""
+    if summary["cost"] is None:
+        base = subject + " cost unknown (no price for " + ", ".join(summary["unknown_dests"]) + ")"
+    else:
+        base = subject + " cost " + _money(summary["cost"])
+    if summary["wasted"] is None:
+        return base + ", and an unknown amount of it was wasted on failed or blocked runs."
+    return base + f", {_money(summary['wasted'])} of it was wasted on failed or blocked runs."
+
+
 # Columns this API is allowed to expose. Anything else in the table
-# (tokens, cost, strategy, retry text) stays out of every response.
+# (tokens, strategy, retry text) stays out of every response. Cost is
+# computed at read time (see above), never stored by this API.
 TRACE_COLUMNS = (
     "id",
     "trace_id",
@@ -105,11 +179,13 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <div class="stat">rate limited<b id="s-limited">&ndash;</b><small>slowed down</small></div>
 <div class="stat">successes<b id="s-success">&ndash;</b><small>completed</small></div>
 <div class="stat">average latency (seconds)<b id="s-lat">&ndash;</b><small>mean wait per try</small></div>
+<div class="stat">total cost<b id="s-cost">&ndash;</b><small>what all runs cost</small></div>
 </div>
+<p id="cost-line">&hellip;</p>
 <button id="refresh" type="button">Refresh now</button>
 <h2>Runs (newest first)</h2>
 <table aria-label="Runs, newest first">
-<thead><tr><th scope="col">Run</th><th scope="col">summary</th><th scope="col">method</th>
+<thead><tr><th scope="col">Run</th><th scope="col">summary</th><th scope="col">cost</th><th scope="col">method</th>
 <th scope="col">endpoint</th><th scope="col">destination host</th>
 <th scope="col">outcome</th><th scope="col">status</th>
 <th scope="col">bytes in</th><th scope="col">bytes out</th>
@@ -141,6 +217,15 @@ function td(text, num) {
   return c;
 }
 const rowsById = new Map();
+function costCell() {
+  const c = document.createElement("td");
+  c.append(document.createElement("div"), document.createElement("div"));
+  return c;
+}
+function setCostCell(c, cost, line) {
+  c.children[0].textContent = (cost === null || cost === undefined) ? "unknown" : "$" + Number(cost).toFixed(2);
+  c.children[1].textContent = line;
+}
 function makeRunRow(t) {
   const tr = document.createElement("tr");
   const link = document.createElement("a");
@@ -151,7 +236,7 @@ function makeRunRow(t) {
   link.dataset.tid = t.trace_id;
   const idCell = document.createElement("td");
   idCell.appendChild(link);
-  tr.append(idCell, td(""), td(""), td(""), td(""), td(""), td(""),
+  tr.append(idCell, td(""), costCell(), td(""), td(""), td(""), td(""), td(""),
             td("", true), td("", true), td("", true), td("", true));
   updateRunRow(tr, t);
   return tr;
@@ -159,15 +244,16 @@ function makeRunRow(t) {
 function updateRunRow(tr, t) {
   const c = tr.children;
   c[1].textContent = runSummary(t);
-  c[2].textContent = t.method;
-  c[3].textContent = t.endpoint;
-  c[4].textContent = t.dest_host;
-  c[5].textContent = outcomeWords(t);
-  c[6].textContent = t.status;
-  c[7].textContent = t.bytes_in;
-  c[8].textContent = t.bytes_out;
-  c[9].textContent = t.latency_seconds;
-  c[10].textContent = t.attempt_count;
+  setCostCell(c[2], t.cost, t.cost_line);
+  c[3].textContent = t.method;
+  c[4].textContent = t.endpoint;
+  c[5].textContent = t.dest_host;
+  c[6].textContent = outcomeWords(t);
+  c[7].textContent = t.status;
+  c[8].textContent = t.bytes_in;
+  c[9].textContent = t.bytes_out;
+  c[10].textContent = t.latency_seconds;
+  c[11].textContent = t.attempt_count;
 }
 function outcomeWords(t) {
   if (t.outcome === "blocked") return "blocked by the allowlist";
@@ -193,6 +279,8 @@ async function load() {
     document.getElementById("s-limited").textContent = s.rate_limited;
     document.getElementById("s-success").textContent = s.successes;
     document.getElementById("s-lat").textContent = s.avg_latency_seconds;
+  document.getElementById("s-cost").textContent = (s.total_cost === null || s.total_cost === undefined) ? "unknown" : "$" + Number(s.total_cost).toFixed(2);
+  document.getElementById("cost-line").textContent = s.cost_line;
     const body = document.getElementById("traces");
     const seen = new Set();
     let prev = null;
@@ -224,6 +312,9 @@ async function showTrace(tid) {
   box.replaceChildren();
   const h = document.createElement("h3");
   h.textContent = "Run " + tid;
+  const d = await getJSON("/traces/" + encodeURIComponent(tid));
+  const cline = document.createElement("p");
+  cline.textContent = d.cost_line;
   const tab = document.createElement("table");
   tab.setAttribute("aria-label", "Attempts in run " + tid);
   tab.innerHTML = '<thead><tr><th scope="col">attempt</th>' +
@@ -233,19 +324,21 @@ async function showTrace(tid) {
     '<th scope="col">http</th><th scope="col">bytes in</th>' +
     '<th scope="col">bytes out</th>' +
     '<th scope="col">latency (seconds)</th>' +
+    '<th scope="col">cost</th>' +
     '<th scope="col">reason</th></tr></thead>';
   const tb = document.createElement("tbody");
-  for (const a of (await getJSON("/traces/" + encodeURIComponent(tid))).attempts) {
+  for (const a of d.attempts) {
     const tr = document.createElement("tr");
     tr.append(td(a.attempt, true), td(a.created_at), td(a.method),
               td(a.endpoint), td(a.dest_host), td(a.outcome),
               td(a.status), td(a.http_status, true), td(a.bytes_in, true),
               td(a.bytes_out, true), td(a.latency_seconds, true),
+              td(a.cost === null ? "unknown" : "$" + Number(a.cost).toFixed(2), a.cost !== null),
               td(a.reason));
     tb.appendChild(tr);
   }
   tab.appendChild(tb);
-  box.append(h, tab);
+  box.append(h, cline, tab);
 }
 document.getElementById("traces").addEventListener("click", (e) => {
   const link = e.target.closest("a[data-tid]");
@@ -289,7 +382,20 @@ def list_traces(limit: int = 20) -> dict:
             """,
             (limit,),
         ).fetchall()
-        return {"traces": [dict(r) for r in rows]}
+        by_trace = {}
+        for r in conn.execute(
+            "SELECT trace_id, dest_host, outcome, status, cost_dollars FROM attempts"
+        ):
+            by_trace.setdefault(r["trace_id"], []).append(r)
+        traces = []
+        for r in rows:
+            d = dict(r)
+            summary = summarize_costs(by_trace.get(d["trace_id"], []))
+            d["cost"] = summary["cost"]
+            d["cost_wasted"] = summary["wasted"]
+            d["cost_line"] = run_cost_line(summary)
+            traces.append(d)
+        return {"traces": traces}
     finally:
         conn.close()
 
@@ -303,12 +409,25 @@ def get_trace(trace_id: str) -> dict:
     try:
         cols = ", ".join(TRACE_COLUMNS)
         rows = conn.execute(
-            f"SELECT {cols} FROM attempts WHERE trace_id = ? ORDER BY id",
+            f"SELECT {cols}, cost_dollars FROM attempts WHERE trace_id = ? ORDER BY id",
             (trace_id,),
         ).fetchall()
         if not rows:
             raise HTTPException(status_code=404, detail="trace not found")
-        return {"trace_id": trace_id, "attempts": [dict(r) for r in rows]}
+        attempts = []
+        for r in rows:
+            d = dict(r)
+            d["cost"] = attempt_cost(r)
+            del d["cost_dollars"]
+            attempts.append(d)
+        summary = summarize_costs(rows)
+        return {
+            "trace_id": trace_id,
+            "attempts": attempts,
+            "cost": summary["cost"],
+            "cost_wasted": summary["wasted"],
+            "cost_line": run_cost_line(summary),
+        }
     finally:
         conn.close()
 
@@ -336,6 +455,13 @@ def stats() -> dict:
             FROM attempts
             """
         ).fetchone()
+        cost_rows = conn.execute(
+            "SELECT trace_id, dest_host, outcome, status, cost_dollars FROM attempts"
+        ).fetchall()
+        summary = summarize_costs(cost_rows)
+        unknown_runs = len({
+            r["trace_id"] for r in cost_rows if attempt_cost(r) is None
+        })
         return {
             "total_attempts": total,
             "allowed": counts["allowed"],
@@ -343,6 +469,10 @@ def stats() -> dict:
             "rate_limited": counts["rate_limited"],
             "successes": row[0] or 0,
             "avg_latency_seconds": row[1] or 0.0,
+            "total_cost": summary["cost"],
+            "wasted_cost": summary["wasted"],
+            "unknown_runs": unknown_runs,
+            "cost_line": run_cost_line(summary, subject="all runs"),
         }
     finally:
         conn.close()

@@ -21,6 +21,7 @@ ALLOWED_KEYS = {
     "id", "trace_id", "attempt", "status", "latency_seconds",
     "created_at", "dest_host", "endpoint", "method", "bytes_in",
     "bytes_out", "http_status", "outcome", "reason", "attempt_count",
+    "cost", "cost_wasted", "cost_line",
 }
 
 
@@ -88,6 +89,10 @@ class ApiShapeTest(unittest.TestCase):
             "rate_limited": 0,
             "successes": 2,
             "avg_latency_seconds": 1.0,
+            "total_cost": 0.0,
+            "wasted_cost": 0.0,
+            "unknown_runs": 0,
+            "cost_line": "all runs cost $0.00, $0.00 of it was wasted on failed or blocked runs.",
         })
 
 
