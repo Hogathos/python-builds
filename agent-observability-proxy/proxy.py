@@ -528,8 +528,12 @@ def _default_db_path() -> str:
             exe_path = PureWindowsPath(exe)
             exe_dir = exe_path.parent
             if exe_dir.name.lower() == "dist":
-                return str(exe_dir.parent / "attempts.db")
-            return str(exe_dir / "attempts.db")
+                candidate = exe_dir.parent / "attempts.db"
+            else:
+                candidate = exe_dir / "attempts.db"
+            if os.name == "nt":
+                return str(candidate)
+            return candidate.as_posix()
         exe_dir = os.path.dirname(os.path.abspath(exe))
         if os.path.basename(exe_dir).lower() == "dist":
             return os.path.join(os.path.dirname(exe_dir), "attempts.db")
