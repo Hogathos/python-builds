@@ -83,7 +83,7 @@ status=failure: ids 3, 4, 8, 9, 10, 11, 12 (7 rows).
 
 ### Kill-switch test — fail-closed proven two ways (Nov 10, user-supplied setup)
 
-Setup (user-supplied; the `--relay-timeout` flag exists at [proxy.py](../proxy.py) line 519): proxy on port 8888, fresh `kill-switch-test.db`, allowlist `127.0.0.1`, `localhost`, `::1`, `api.meta.ai`, `--relay-timeout 300`.
+Setup (user-supplied; the `--relay-timeout` flag exists at [proxy.py](../proxy.py) line 554): proxy on port 8888, fresh `kill-switch-test.db`, allowlist `127.0.0.1`, `localhost`, `::1`, `api.meta.ai`, `--relay-timeout 300`.
 
 - Prompt "say hi" with the proxy up: succeeded. Observed in this session: `kill-switch-test.db` holds exactly 2 rows, both `CONNECT api.meta.ai:443`, `outcome=allowed`, `status=success` — 100% success on the live leg.
 - Proxy stopped, prompt "hello again": failed with a transport error after 4 provider attempts (user-supplied). Observed in this session: the file still holds exactly 2 rows — zero new rows while the proxy was down.

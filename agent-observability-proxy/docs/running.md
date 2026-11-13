@@ -53,7 +53,7 @@ python visualizer.py --db attempts.db --output trace-diagram.md --seed-demo
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests -v   # 36 tests
+python -m unittest discover -s tests -v   # 60 tests
 ```
 
 ## Load testing

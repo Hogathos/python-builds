@@ -2,7 +2,7 @@
 
 How the proxy works: milestones, trace propagation, policy, and schema.
 For commands, see [running](running.md). Status: M4 + visualizer v2 +
-T1–T9 fixes, suite 36/36.
+T1–T9 fixes, suite 60/60.
 
 ## Milestones
 

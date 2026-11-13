@@ -8,7 +8,7 @@ Local proxy that watches agent traffic and logs what happened, metadata only.
 
 **Never logs request/response bodies, API keys, or header values.** No TLS interception, no MITM.
 
-Status: M4 + visualizer v2 + T1–T9 fixes. Suite 36/36.
+Status: M4 + visualizer v2 + T1–T9 fixes. Suite 60/60.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ python report.py --db attempts.db    # headline metrics
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests -v   # 36 tests
+python -m unittest discover -s tests -v   # 60 tests
 ```
 
 ## Docs
@@ -45,4 +45,4 @@ How to read a trace: `python report.py --db attempts.db` (see `report.py`): one 
 
 What it can't see: TLS is opaque — a CONNECT tunnel logs destination / timing / size only, no decrypted payload, no per-request detail inside a tunnel. No priced cost — tokens 0, cost $0.0000 measured, no usage signal through a tunnel.
 
-Evidence: suite 36/36; Locust 37.1 req/s with 0 failures in 1427; dogfood Day 1 3/3; Day 2 12 attempts / 5 success; kill-switch passed fail-closed; eval report + golden dataset v2 in `evals`, commits 7e39e2c and e4fca47.
+Evidence: suite 60/60; Locust 37.1 req/s with 0 failures in 1427; dogfood Day 1 3/3; Day 2 12 attempts / 5 success; kill-switch passed fail-closed; eval report + golden dataset v2 in `evals`, commits 7e39e2c and e4fca47.
