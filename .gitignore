@@ -4,5 +4,7 @@ attempts.db
 *.exe
 pycache/
 *.pyc
-n*.dbn.pytest_cache/
+*.db
+.pytest_cache/
 *.spec
+
