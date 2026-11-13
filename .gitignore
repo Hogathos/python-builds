@@ -1,9 +1,6 @@
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
+build/
+dist/
 attempts.db
-*.db
-.DS_Store
-.idea/
+*.exe
+pycache/
+*.pyc
