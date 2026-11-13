@@ -34,8 +34,10 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import select
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -506,11 +508,25 @@ def serve(host: str = "127.0.0.1", port: int = 8888,
     return server
 
 
-def main():
+def _default_db_path() -> str:
+    """Project-folder attempts.db, wherever the process was started from.
+
+    Frozen exe inside dist/ -> the project folder above dist/.
+    Frozen exe elsewhere -> beside the exe. Plain python -> beside proxy.py.
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if os.path.basename(exe_dir).lower() == "dist":
+            return os.path.join(os.path.dirname(exe_dir), "attempts.db")
+        return os.path.join(exe_dir, "attempts.db")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "attempts.db")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="M1-M4 local proxy (HTTP + CONNECT + allowlist/rate limit)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8888)
-    parser.add_argument("--db", default="attempts.db")
+    parser.add_argument("--db", default=_default_db_path())
     parser.add_argument("--allowlist", default=",".join(DEFAULT_ALLOWLIST),
                         help="comma-separated allowed hosts (or host:port)")
     parser.add_argument("--rate-limit", type=int, default=RATE_LIMIT)
@@ -520,7 +536,11 @@ def main():
                         default=RELAY_IDLE_TIMEOUT_SECONDS,
                         help="seconds of CONNECT tunnel silence before "
                              "the relay gives up (default 30)")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     server = serve(args.host, args.port, args.db,
                    allowlist=args.allowlist.split(","),
                    rate_limit=args.rate_limit, rate_window=args.rate_window,
