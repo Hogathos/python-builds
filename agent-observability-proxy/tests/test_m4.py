@@ -110,7 +110,8 @@ class M4AllowlistRateLimitTest(unittest.TestCase):
         self.assertEqual(row["outcome"], "blocked")
         self.assertEqual(row["status"], "blocked")
         self.assertEqual(row["reason"], "not_allowlisted")
-        self.assertEqual(row["dest_host"], "exfil.example.test")
+        # The blocked row names the exact rejected host:port.
+        self.assertEqual(row["dest_host"], "exfil.example.test:80")
         self.assertEqual((row["bytes_in"], row["bytes_out"]), (0, 0))
         self.assertGreaterEqual(row["latency_seconds"], 0)
         dump = "\n".join(str(r) for r in self.rows())

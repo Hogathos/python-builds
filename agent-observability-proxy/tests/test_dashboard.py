@@ -41,6 +41,15 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("makeRunRow", body)
         self.assertIn("updateRunRow", body)
         self.assertIn("insertBefore", body)
+        self.assertIn("CONNECT (tunnel)", body)
+        self.assertIn("1 tunnel", body)
+        self.assertIn("sent", body)
+        self.assertIn("received", body)
+        self.assertIn("connect (ms)", body)
+        self.assertIn("how it ended", body)
+        self.assertIn("allowBlockCell", body)
+        self.assertIn("allowhint", body)
+        self.assertIn("closeWords", body)
 
     def test_nothing_is_cached(self):
         # This sandbox blocks every listen() call, including the one the

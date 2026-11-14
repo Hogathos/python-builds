@@ -165,7 +165,9 @@ class M2ConnectTest(unittest.TestCase):
                     if r["trace_id"] == "trace-idle-t5"]
             conn.close()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["status"], "failure")
+            # A silent tunnel blames no one: unknown, never failed.
+            self.assertEqual(rows[0]["status"], "unknown")
+            self.assertEqual(rows[0]["close_reason"], "relay_timeout")
             self.assertEqual((rows[0]["bytes_in"], rows[0]["bytes_out"]), (0, 0))
         finally:
             proxy.shutdown()

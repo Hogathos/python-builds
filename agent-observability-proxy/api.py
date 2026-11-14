@@ -113,6 +113,11 @@ TRACE_COLUMNS = (
     "method",
     "bytes_in",
     "bytes_out",
+    "bytes_tx",
+    "bytes_rx",
+    "close_reason",
+    "connect_ms",
+    "duration_ms",
     "http_status",
     "outcome",
     "reason",
@@ -194,6 +199,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 </table>
 <h2>Run detail</h2>
 <div id="detail"><p>Click a Run to see its attempts.</p></div>
+<p id="allowhint" role="status"></p>
 <noscript><p>This dashboard needs JavaScript turned on to load numbers.</p></noscript>
 <script>
 document.getElementById("live").textContent = "Live — starting first update…";
@@ -245,7 +251,7 @@ function updateRunRow(tr, t) {
   const c = tr.children;
   c[1].textContent = runSummary(t);
   setCostCell(c[2], t.cost, t.cost_line);
-  c[3].textContent = t.method;
+  c[3].textContent = isTunnel(t) ? "CONNECT (tunnel)" : t.method;
   c[4].textContent = t.endpoint;
   c[5].textContent = t.dest_host;
   c[6].textContent = outcomeWords(t);
@@ -262,7 +268,14 @@ function outcomeWords(t) {
   if (t.status === "success") return "allowed";
   return "failed";
 }
+function isTunnel(t) {
+  return t.method === "CONNECT";
+}
 function runSummary(t) {
+  if (isTunnel(t)) {
+    return "Tunnel to " + t.endpoint + " — 1 tunnel (" +
+      outcomeWords(t) + "), contents not visible.";
+  }
   return "Tried " + t.method + " " + t.dest_host + t.endpoint +
     " — " + outcomeWords(t) + ".";
 }
@@ -307,6 +320,62 @@ async function load() {
     setLive("Live — update failed, will retry. (" + err.message + ")");
   }
 }
+function fmtMs(v) {
+  if (v === null || v === undefined) return "unknown";
+  return Number(v).toFixed(1);
+}
+function closeWords(v) {
+  // Plain words for how a row ended. Empty means the row predates
+  // close reasons, or none of the known reasons applied.
+  if (!v) return "unknown";
+  if (v === "client_eof") return "client hung up";
+  if (v === "upstream_reset") return "destination failed";
+  if (v === "blocked_allowlist") return "blocked by the allowlist";
+  if (v === "rate_limited") return "slowed down by the rate limit";
+  if (v === "relay_timeout") return "tunnel went quiet past the timeout";
+  if (v === "success") return "finished";
+  return "unknown";
+}
+function copyText(text, hint) {
+  const box = document.getElementById("allowhint");
+  function done(ok) {
+    box.textContent = hint + (ok ? "" : " (copy failed — select it yourself)");
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { done(true); },
+      function () { done(false); });
+  } else {
+    done(false);
+  }
+}
+function allowBlockCell(a) {
+  // Copy helpers only: the API is GET-only, so these buttons never
+  // change policy. Allow copies the exact host:port to paste into the
+  // proxy --allowlist; Block restates that it stays blocked.
+  const cell = document.createElement("td");
+  cell.textContent = a.reason + " ";
+  const hostport = a.dest_host;
+  const allow = document.createElement("button");
+  allow.type = "button";
+  allow.textContent = "Allow";
+  allow.setAttribute("aria-label", "Copy " + hostport + " for the allowlist");
+  allow.addEventListener("click", function () {
+    copyText(hostport, "Allow: add " + hostport +
+      " to the proxy --allowlist and restart it. " +
+      "Nothing was changed — this button only copies.");
+  });
+  const block = document.createElement("button");
+  block.type = "button";
+  block.textContent = "Block";
+  block.setAttribute("aria-label", "Keep " + hostport + " blocked");
+  block.addEventListener("click", function () {
+    copyText(hostport, "Block: " + hostport +
+      " is already blocked and stays blocked. " +
+      "Nothing was changed — this button only copies.");
+  });
+  cell.append(allow, document.createTextNode(" "), block);
+  return cell;
+}
 async function showTrace(tid) {
   const box = document.getElementById("detail");
   box.replaceChildren();
@@ -321,20 +390,28 @@ async function showTrace(tid) {
     '<th scope="col">time</th><th scope="col">method</th>' +
     '<th scope="col">endpoint</th><th scope="col">destination host</th>' +
     '<th scope="col">outcome</th><th scope="col">status</th>' +
-    '<th scope="col">http</th><th scope="col">bytes in</th>' +
-    '<th scope="col">bytes out</th>' +
-    '<th scope="col">latency (seconds)</th>' +
+    '<th scope="col">http</th><th scope="col">sent</th>' +
+    '<th scope="col">received</th>' +
+    '<th scope="col">connect (ms)</th>' +
+    '<th scope="col">duration (ms)</th>' +
+    '<th scope="col">how it ended</th>' +
     '<th scope="col">cost</th>' +
     '<th scope="col">reason</th></tr></thead>';
   const tb = document.createElement("tbody");
   for (const a of d.attempts) {
     const tr = document.createElement("tr");
-    tr.append(td(a.attempt, true), td(a.created_at), td(a.method),
+    const sent = td(a.bytes_tx, true);
+    sent.title = "bytes the proxy sent toward the destination";
+    const received = td(a.bytes_rx, true);
+    received.title = "bytes the proxy got back from the destination";
+    const methodCell = td(isTunnel(a) ? "CONNECT (tunnel)" : a.method);
+    tr.append(td(a.attempt, true), td(a.created_at), methodCell,
               td(a.endpoint), td(a.dest_host), td(a.outcome),
-              td(a.status), td(a.http_status, true), td(a.bytes_in, true),
-              td(a.bytes_out, true), td(a.latency_seconds, true),
+              td(a.status), td(a.http_status, true), sent, received,
+              td(fmtMs(a.connect_ms), true), td(fmtMs(a.duration_ms), true),
+              td(closeWords(a.close_reason)),
               td(a.cost === null ? "unknown" : "$" + Number(a.cost).toFixed(2), a.cost !== null),
-              td(a.reason));
+              a.outcome === "blocked" ? allowBlockCell(a) : td(a.reason));
     tb.appendChild(tr);
   }
   tab.appendChild(tb);

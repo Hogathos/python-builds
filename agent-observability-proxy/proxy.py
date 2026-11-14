@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import ipaddress
 import json
 import os
 import select
@@ -52,10 +53,133 @@ RATE_LIMIT = 100            # max forwarded requests per destination ...
 RATE_WINDOW_SECONDS = 10.0  # ... inside this sliding window
 RELAY_IDLE_TIMEOUT_SECONDS = 30.0  # tunnel silence before relay gives up
 
+MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024  # bigger request bodies get a plain-words 413, never silent truncation
+MAX_REQUEST_LINE_BYTES = 8192  # longer request lines get a plain-words 400
+MAX_HEADER_BYTES = 65536  # more header bytes total get a plain-words 400
+RELAY_CHUNK_BYTES = 65536  # stream step both ways: headers first, then body in chunks
+MAX_BUFFERED_RESPONSE_BYTES = 1024 * 1024  # up to this many body bytes are read whole (row logged first); past it, or with no length, the body streams and its row lands when the stream ends
+
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-connection", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade",
 }
+
+
+def _parse_port(text: str, authority: str) -> int:
+    """Port number or ValueError; the caller answers 400."""
+    port = int(text)
+    if not 0 < port < 65536:
+        raise ValueError(f"bad port in {authority!r}")
+    return port
+
+
+def _split_authority(authority: str, default_port: int | None) -> tuple[str, int | None]:
+    """Split host[:port]; bracketed [v6]:port keeps brackets off the host.
+
+    A bare IPv6 address (more than one colon, no brackets) is the host
+    with no port. Raises ValueError on a bad or missing port.
+    """
+    text = authority.strip()
+    if text.startswith("["):
+        end = text.find("]")
+        if end == -1:
+            raise ValueError(f"bad authority {authority!r}")
+        host = text[1:end]
+        rest = text[end + 1:]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError(f"bad authority {authority!r}")
+        return host, _parse_port(rest[1:], authority)
+    if text.count(":") > 1:
+        return text, default_port
+    host, sep, port = text.rpartition(":")
+    if not sep:
+        return text, default_port
+    return host, _parse_port(port, authority)
+
+
+def _dotted_numbers_value(text: str) -> int | None:
+    """inet_aton-style value for 1-4 numeric parts, else None.
+
+    Parts may be decimal, 0x hex, or 0-prefixed octal, so 0x7f.0.0.1,
+    0177.0.0.1, 127.1, and 2130706433 all reduce to 127.0.0.1.
+    Non-numeric text returns None and is treated as a hostname.
+    """
+    parts = text.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    nums = []
+    for part in parts:
+        if not part:
+            return None
+        try:
+            if part.lower().startswith("0x"):
+                nums.append(int(part, 16))
+            elif len(part) > 1 and part.startswith("0") and part.isdigit():
+                nums.append(int(part, 8))
+            elif part.isdigit():
+                nums.append(int(part, 10))
+            else:
+                return None
+        except ValueError:
+            return None
+    width = {1: 32, 2: 24, 3: 16, 4: 8}[len(nums)]
+    if any(n > 255 for n in nums[:-1]) or nums[-1] >= (1 << width):
+        return None
+    value = 0
+    for num, shift in zip(nums, (24, 16, 8)[:len(nums) - 1] + (0,)):
+        value |= num << shift
+    return value
+
+
+def _format_label(host: str, port: int | None) -> str:
+    """host:port for log rows; brackets back on a bare IPv6 host."""
+    if port is None:
+        return host
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def _normalize_host(text: str) -> str:
+    """One canonical spelling per host, for allowlist matching only.
+
+    Lowercase, no brackets, no trailing dot; every numeric IP form
+    (hex/octal/short/decimal, IPv4-mapped IPv6) reduced to the plain
+    address. Names that are not IPs compare as plain lowercase text,
+    so "localhost" never equals 127.0.0.1: no DNS is consulted.
+    """
+    cleaned = text.strip().lower()
+    if len(cleaned) > 1 and cleaned.endswith("."):
+        cleaned = cleaned[:-1]
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        mapped = getattr(addr, "ipv4_mapped", None)
+        return str(mapped) if mapped is not None else str(addr)
+    value = _dotted_numbers_value(cleaned)
+    if value is not None:
+        try:
+            return str(ipaddress.IPv4Address(value))
+        except ValueError:
+            pass
+    return cleaned
+
+
+_NEVER_PORT = object()  # allowlist entry port that matches nothing
+
+
+class _BodyTooBig(Exception):
+    """Request body past MAX_REQUEST_BODY_BYTES; the caller answers 413."""
+
+
+class _BadFraming(Exception):
+    """Request framing the proxy refuses; the caller answers 400."""
 
 
 def _usage_input_tokens(body: bytes, content_type: str) -> int:
@@ -92,6 +216,17 @@ class ProxyState:
             entry.strip().lower() for entry in
             (allowlist if allowlist is not None else DEFAULT_ALLOWLIST)
             if entry.strip())
+        # Parsed once up front: (normalized host, port or None for any).
+        # An entry that does not parse gets a port that matches nothing,
+        # so a typo fails closed instead of opening the proxy.
+        self._normalized_allowlist = []
+        for entry in self.allowlist:
+            try:
+                entry_host, entry_port = _split_authority(entry, None)
+                entry_host = _normalize_host(entry_host)
+            except ValueError:
+                entry_host, entry_port = _normalize_host(entry), _NEVER_PORT
+            self._normalized_allowlist.append((entry_host, entry_port))
         self.rate_limit = int(rate_limit)
         self.rate_window = float(rate_window)
         self.relay_timeout = float(relay_timeout)
@@ -106,27 +241,16 @@ class ProxyState:
 
         A bare host (IPv4, hostname, or IPv6 with or without brackets)
         matches on any port. A host:port entry matches only that exact
-        port; IPv6 host:port must use brackets ([::1]:18080).
+        port; IPv6 host:port must use brackets ([::1]:18080). Both sides
+        are normalized first, so 0x7f.0.0.1, 2130706433, 0177.0.0.1,
+        ::ffff:127.0.0.1, 127.1, and trailing-dot or mixed-case names
+        match the same entry as their plain spelling.
         """
-        host = dest_host.strip().lower()
-        if host.startswith("[") and host.endswith("]"):
-            host = host[1:-1]
-        for entry in self.allowlist:
-            if entry.startswith("["):
-                if "]:" in entry:
-                    ehost, _, eport = entry[1:].partition("]:")
-                    try:
-                        if ehost == host and int(eport) == dest_port:
-                            return True
-                    except ValueError:
-                        continue
-                elif entry.endswith("]"):
-                    if entry[1:-1] == host:
-                        return True
-            elif entry.count(":") == 1:
-                if entry == f"{host}:{dest_port}":
-                    return True
-            elif entry == host:
+        host = _normalize_host(dest_host)
+        for entry_host, entry_port in self._normalized_allowlist:
+            if entry_host != host:
+                continue
+            if entry_port is None or entry_port == dest_port:
                 return True
         return False
 
@@ -197,13 +321,25 @@ class _RelayTimeout(Exception):
         self.bytes_out = bytes_out
 
 
+class _RelayBroken(Exception):
+    """A relay socket errored; carries bytes and which side broke."""
+
+    def __init__(self, bytes_in: int, bytes_out: int, close_reason: str):
+        super().__init__("relay socket broke")
+        self.bytes_in = bytes_in
+        self.bytes_out = bytes_out
+        self.close_reason = close_reason
+
+
 def _relay(client: socket.socket, upstream: socket.socket,
-           timeout: float = RELAY_IDLE_TIMEOUT_SECONDS) -> tuple[int, int]:
-    """Relay raw bytes both ways; return (bytes_in, bytes_out).
+           timeout: float = RELAY_IDLE_TIMEOUT_SECONDS
+           ) -> tuple[int, int, str]:
+    """Relay raw bytes both ways; return (bytes_in, bytes_out, close_reason).
 
     Bytes are counted, never inspected, stored, or logged. bytes_in is
     client -> destination, bytes_out is destination -> client. Silence
-    longer than timeout raises _RelayTimeout with partial counts.
+    longer than timeout raises _RelayTimeout with partial counts; a
+    socket error raises _RelayBroken naming the side that broke.
     """
     bytes_in = bytes_out = 0
     sockets = [client, upstream]
@@ -212,15 +348,25 @@ def _relay(client: socket.socket, upstream: socket.socket,
         if not readable:
             raise _RelayTimeout(bytes_in, bytes_out)
         for sock in readable:
-            data = sock.recv(65536)
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                raise _RelayBroken(
+                    bytes_in, bytes_out,
+                    "client_eof" if sock is client else "upstream_reset")
             if not data:
-                return bytes_in, bytes_out
-            if sock is client:
-                upstream.sendall(data)
-                bytes_in += len(data)
-            else:
-                client.sendall(data)
-                bytes_out += len(data)
+                return bytes_in, bytes_out, "success"
+            try:
+                if sock is client:
+                    upstream.sendall(data)
+                    bytes_in += len(data)
+                else:
+                    client.sendall(data)
+                    bytes_out += len(data)
+            except OSError:
+                raise _RelayBroken(
+                    bytes_in, bytes_out,
+                    "upstream_reset" if sock is client else "client_eof")
 
 
 def make_handler(state: ProxyState):
@@ -234,36 +380,39 @@ def make_handler(state: ProxyState):
         def do_CONNECT(self):
             start = time.perf_counter()
             trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
-            endpoint = self.path  # CONNECT authority form: host:port
-            if ":" in endpoint:
-                dest_host, port_text = endpoint.rsplit(":", 1)
-                try:
-                    dest_port = int(port_text)
-                except ValueError:
-                    dest_port = -1
-            else:
-                dest_host, dest_port = endpoint, 443
-            endpoint = f"{dest_host}:{dest_port}"
+            try:
+                dest_host, dest_port = _split_authority(self.path, 443)
+            except ValueError:
+                # Unparseable authority: keep the old shape (blocked row,
+                # 403) rather than inventing a new refusal for it.
+                dest_host, dest_port = self.path, -1
+            endpoint = _format_label(dest_host, dest_port)
             task_number = state.task_number(
                 trace_id, self.headers.get("X-Task-Number"))
             strategy = self.headers.get("X-Strategy") or "proxy"
 
             def log_connect(status, outcome, reason, http_status,
-                            bytes_in, bytes_out):
+                            bytes_in, bytes_out, close_reason,
+                            connect_ms=None):
+                duration_ms = (time.perf_counter() - start) * 1000.0
                 db_module.log_attempt(
                     state.conn, trace_id=trace_id,
                     task_number=task_number, attempt=attempt,
                     strategy=strategy, status=status,
-                    latency_seconds=time.perf_counter() - start,
+                    latency_seconds=duration_ms / 1000.0,
                     retry_reason=_retry_reason(attempt),
                     dest_host=endpoint, endpoint=endpoint,
                     method="CONNECT", bytes_in=bytes_in,
                     bytes_out=bytes_out, http_status=http_status,
-                    outcome=outcome, reason=reason)
+                    outcome=outcome, reason=reason,
+                    bytes_tx=bytes_in, bytes_rx=bytes_out,
+                    close_reason=close_reason, connect_ms=connect_ms,
+                    duration_ms=duration_ms)
 
             if not state.is_allowed(dest_host, dest_port):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
-                log_connect("blocked", "blocked", "not_allowlisted", 403, 0, 0)
+                log_connect("blocked", "blocked", "not_allowlisted", 403,
+                            0, 0, "blocked_allowlist")
                 self.send_response(403)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
@@ -272,7 +421,7 @@ def make_handler(state: ProxyState):
             if not state.check_rate(endpoint):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
                 log_connect("rate_limited", "rate_limited", "rate_limited",
-                            429, 0, 0)
+                            429, 0, 0, "rate_limited")
                 self.send_response(429)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
@@ -282,15 +431,19 @@ def make_handler(state: ProxyState):
             # Numbered only once the tunnel will actually be opened.
             attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
             upstream = None
+            connect_start = time.perf_counter()
             try:
                 upstream = socket.create_connection(
                     (dest_host, dest_port), timeout=10)
+                connect_ms = (time.perf_counter() - connect_start) * 1000.0
             except Exception:
+                connect_ms = (time.perf_counter() - connect_start) * 1000.0
+                log_connect("failure", "allowed", "", None, 0, 0,
+                            "upstream_reset", connect_ms)
                 self.send_response(502)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                log_connect("failure", "allowed", "", None, 0, 0)
                 return
 
             self.send_response(200)
@@ -298,18 +451,27 @@ def make_handler(state: ProxyState):
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            status, bytes_in, bytes_out = "success", 0, 0
+            status, bytes_in, bytes_out, close_reason = "success", 0, 0, "success"
             try:
-                bytes_in, bytes_out = _relay(
+                bytes_in, bytes_out, close_reason = _relay(
                     self.connection, upstream, timeout=state.relay_timeout)
             except _RelayTimeout as exc:
+                # A silent tunnel tells us nothing about who is at fault,
+                # so the status stays unknown, never failed.
+                status = "unknown"
+                bytes_in, bytes_out = exc.bytes_in, exc.bytes_out
+                close_reason = "relay_timeout"
+            except _RelayBroken as exc:
                 status = "failure"
                 bytes_in, bytes_out = exc.bytes_in, exc.bytes_out
+                close_reason = exc.close_reason
             except Exception:
                 status = "failure"
+                close_reason = "unknown"
             finally:
                 upstream.close()
-            log_connect(status, "allowed", "", None, bytes_in, bytes_out)
+            log_connect(status, "allowed", "", None, bytes_in, bytes_out,
+                        close_reason, connect_ms)
 
         def _target(self):
             """Return (host, port, endpoint), None if unsupported.
@@ -324,14 +486,131 @@ def make_handler(state: ProxyState):
                 endpoint = parsed.path or "/"
                 if parsed.query:
                     endpoint += "?" + parsed.query
-                return parsed.hostname, parsed.port or 80, endpoint
+                try:
+                    port = parsed.port or 80
+                except ValueError:
+                    raise ValueError(f"bad port in {self.path!r}")
+                return parsed.hostname, port, endpoint
             host_header = self.headers.get("Host", "")
             if not host_header:
                 return None
-            if ":" in host_header:
-                host, port = host_header.rsplit(":", 1)
-                return host, int(port), self.path
-            return host_header, 80, self.path
+            host, port = _split_authority(host_header, 80)
+            if not host:
+                raise ValueError(f"bad host in {host_header!r}")
+            return host, port, self.path
+
+        def send_error(self, code, message=None, explain=None):
+            # Unknown methods land here (no do_<METHOD> exists). Log a row
+            # with plain words instead of the stdlib silent HTML 501.
+            if code == http.client.NOT_IMPLEMENTED and hasattr(self, "command"):
+                if not hasattr(self, "_refused_start"):
+                    self._refused_start = time.perf_counter()
+                headers = getattr(self, "headers", None) or {}
+                get = headers.get if hasattr(headers, "get") else (lambda k, d=None: d)
+                trace_id = get("X-Trace-Id") or str(uuid.uuid4())
+                body = (f"{self.command} is not supported by this proxy, "
+                        "request not forwarded by proxy\n").encode()
+                self._refused(501, "failure", "unimplemented_method",
+                              get("Host") or "", self.path or "", body,
+                              trace_id=trace_id)
+                return
+            super().send_error(code, message, explain)
+
+        def _refused(self, code, status, reason, dest_host, endpoint,
+                     body, trace_id=None, close_reason="unknown"):
+            """Refuse a request with a plain-words body plus an audit row."""
+            if trace_id is None:
+                trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
+            task_number = state.task_number(
+                trace_id, self.headers.get("X-Task-Number"))
+            attempt = state.peek_attempt(trace_id, endpoint, self.command
+                                         if hasattr(self, "command") else "")
+            strategy = self.headers.get("X-Strategy") or "proxy"
+            duration_ms = None
+            start = getattr(self, "_refused_start", None)
+            if start is not None:
+                duration_ms = (time.perf_counter() - start) * 1000.0
+            db_module.log_attempt(
+                state.conn, trace_id=trace_id,
+                task_number=task_number, attempt=attempt,
+                strategy=strategy, status=status,
+                latency_seconds=(duration_ms / 1000.0
+                                 if duration_ms is not None else 0.0),
+                retry_reason=_retry_reason(attempt),
+                dest_host=dest_host, endpoint=endpoint,
+                method=getattr(self, "command", ""),
+                bytes_in=0, bytes_out=0,
+                http_status=code, outcome=status, reason=reason,
+                close_reason=close_reason, duration_ms=duration_ms)
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Trace-Id", trace_id)
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+            self.close_connection = True
+
+        def _chunked_body(self):
+            """Yield de-chunked request body pieces from a chunked request.
+
+            Raises _BadFraming on bad chunk framing, _BodyTooBig past the cap.
+            """
+            total = 0
+            while True:
+                line = self.rfile.readline(MAX_REQUEST_LINE_BYTES + 1)
+                if not line.endswith(b"\n") or len(line) > MAX_REQUEST_LINE_BYTES:
+                    raise _BadFraming("chunk size line too long")
+                try:
+                    size = int(line.split(b";")[0].strip(), 16)
+                except ValueError:
+                    raise _BadFraming("bad chunk size")
+                if size < 0:
+                    raise _BadFraming("negative chunk size")
+                if size == 0:
+                    while True:  # trailers are read and ignored, never logged
+                        trailer = self.rfile.readline(
+                            MAX_REQUEST_LINE_BYTES + 1)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            return
+                        if (not trailer.endswith(b"\n")
+                                or len(trailer) > MAX_REQUEST_LINE_BYTES):
+                            raise _BadFraming("trailer line too long")
+                total += size
+                if total > MAX_REQUEST_BODY_BYTES:
+                    raise _BodyTooBig()
+                piece = b""
+                while len(piece) < size:
+                    block = self.rfile.read(size - len(piece))
+                    if not block:
+                        raise _BadFraming("request body ended early")
+                    piece += block
+                crlf = self.rfile.read(2)
+                if crlf != b"\r\n":
+                    raise _BadFraming("chunk missing CRLF")
+                yield piece
+
+        def _forward_body(self, upstream, chunked, length):
+            """Stream the client body upstream; return bytes sent that way."""
+            if chunked:
+                sent = 0
+                for piece in self._chunked_body():
+                    upstream.send(b"%X\r\n" % len(piece))
+                    upstream.send(piece)
+                    upstream.send(b"\r\n")
+                    sent += len(piece)
+                upstream.send(b"0\r\n\r\n")
+                return sent
+            sent = 0
+            while sent < length:
+                piece = self.rfile.read(min(RELAY_CHUNK_BYTES, length - sent))
+                if not piece:
+                    raise _BadFraming("request body ended early")
+                upstream.send(piece)
+                sent += len(piece)
+            return sent
 
         def _reject_malformed_header(self, state, trace_id, start):
             """400 plus an audit row for an unparseable destination."""
@@ -361,7 +640,21 @@ def make_handler(state: ProxyState):
 
         def _handle(self):
             start = time.perf_counter()
+            self._refused_start = start
             trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
+            if len(self.requestline) > MAX_REQUEST_LINE_BYTES:
+                self._refused(400, "failure", "malformed_header", "",
+                              self.path,
+                              b"request line too long, request not forwarded by proxy\n",
+                              trace_id=trace_id)
+                return
+            if sum(len(k) + len(v)
+                   for k, v in self.headers.items()) > MAX_HEADER_BYTES:
+                self._refused(400, "failure", "malformed_header", "",
+                              self.path,
+                              b"headers too big, request not forwarded by proxy\n",
+                              trace_id=trace_id)
+                return
             try:
                 target = self._target()
             except ValueError:
@@ -378,23 +671,133 @@ def make_handler(state: ProxyState):
                 return
 
             dest_host, dest_port, endpoint = target
-            dest_label = (dest_host if dest_port == 80
-                          else f"{dest_host}:{dest_port}")
+            # The blocked row shows this exact host:port, so the dashboard
+            # can name what the allowlist stopped.
+            dest_label = _format_label(dest_host, dest_port)
             task_number = state.task_number(
                 trace_id, self.headers.get("X-Task-Number"))
             strategy = self.headers.get("X-Strategy") or "proxy"
 
-            def reject(code, status, reason):
+            def reject(code, status, reason, close_reason="unknown"):
                 body = f"{status}: request not forwarded by proxy\n".encode()
+                self._refused(code, status, reason, dest_label, endpoint,
+                              body, trace_id=trace_id,
+                              close_reason=close_reason)
+
+            if "upgrade" in self.headers:
+                self._refused(
+                    501, "failure", "upgrade_needs_connect",
+                    dest_label, endpoint,
+                    b"WebSocket needs CONNECT: send a CONNECT tunnel, "
+                    b"not Upgrade on plain HTTP\n",
+                    trace_id=trace_id)
+                return
+            if not state.is_allowed(dest_host, dest_port):
+                reject(403, "blocked", "not_allowlisted",
+                       close_reason="blocked_allowlist")
+                return
+            if not state.check_rate(dest_label):
+                reject(429, "rate_limited", "rate_limited",
+                       close_reason="rate_limited")
+                return
+
+            # Request smuggling hygiene: one length, one framing, never both.
+            lengths = [v.strip() for v in
+                       (self.headers.get_all("Content-Length") or [])]
+            # Any repeat is refused, even two identical ones: dedupe
+            # here and a smuggled length slips past the single read below.
+            if len(lengths) > 1:
+                reject(400, "failure", "duplicate_content_length")
+                return
+            coding = [t.strip() for t in
+                      self.headers.get("Transfer-Encoding", "").lower().split(",")
+                      if t.strip()]
+            chunked = "chunked" in coding
+            if lengths and chunked:
+                reject(400, "failure",
+                       "content_length_with_transfer_encoding")
+                return
+            if coding and not chunked:
+                reject(501, "failure", "unsupported_transfer_coding")
+                return
+            try:
+                length = int(lengths[0]) if lengths else 0
+                if length < 0:
+                    raise ValueError("negative Content-Length")
+            except ValueError:
+                reject(400, "failure", "malformed_header")
+                return
+            if length > MAX_REQUEST_BODY_BYTES:
+                self._refused(
+                    413, "failure", "body_too_big", dest_label, endpoint,
+                    f"request body too big: {length} bytes, "
+                    f"limit {MAX_REQUEST_BODY_BYTES}, "
+                    "request not forwarded by proxy\n".encode(),
+                    trace_id=trace_id)
+                return
+            # Numbered only once the request will actually be forwarded.
+            attempt = state.next_attempt(trace_id, endpoint, self.command)
+
+            headers = {}
+            for key, value in self.headers.items():
+                lowered = key.lower()
+                if lowered in HOP_BY_HOP or lowered == "host":
+                    continue
+                if lowered == "content-length" and chunked:
+                    continue  # re-framed as chunked below
+                if lowered in ("x-task-number", "x-strategy"):
+                    continue  # proxy control headers: used locally, never forwarded
+                headers[key] = value  # forwarded, never logged
+            headers["Host"] = dest_label
+            headers["X-Trace-Id"] = trace_id
+            if chunked:
+                headers["Transfer-Encoding"] = "chunked"
+
+            status, http_status = "error", 502
+            bytes_tx = bytes_rx = 0
+            close_reason = "upstream_reset"
+            connect_ms = None
+            resp_headers: dict = {}
+            try:
+                # One-shot upstream: a fresh connection per request, no pool — threads share nothing.
+                upstream = http.client.HTTPConnection(
+                    dest_host, dest_port, timeout=10)
+                connect_start = time.perf_counter()
+                try:
+                    upstream.connect()
+                finally:
+                    connect_ms = ((time.perf_counter() - connect_start)
+                                  * 1000.0)
+                upstream.putrequest(self.command, endpoint, skip_host=1)
+                for key, value in headers.items():
+                    upstream.putheader(key, value)
+                upstream.endheaders()
+                bytes_tx = self._forward_body(upstream, chunked, length)
+                resp = upstream.getresponse()
+                http_status = resp.status
+                status = ("success" if 200 <= http_status < 400 else "failure")
+                close_reason = "success"
+                resp_headers = dict(resp.getheaders())
+            except (_BadFraming, _BodyTooBig) as framing_error:
+                upstream.close()
+                over_cap = isinstance(framing_error, _BodyTooBig)
+                code = 413 if over_cap else 400
+                reason = "body_too_big" if over_cap else "malformed_header"
+                body = (f"request body past the {MAX_REQUEST_BODY_BYTES} "
+                        "byte cap, request not forwarded by proxy\n".encode()
+                        if over_cap else
+                        b"request body ended early, request not forwarded by proxy\n")
                 db_module.log_attempt(
-                    state.conn, trace_id=trace_id,
-                    task_number=task_number, attempt=attempt,
-                    strategy=strategy, status=status,
+                    state.conn, trace_id=trace_id, task_number=task_number,
+                    attempt=attempt, strategy=strategy, status="failure",
                     latency_seconds=time.perf_counter() - start,
                     retry_reason=_retry_reason(attempt),
                     dest_host=dest_label, endpoint=endpoint,
-                    method=self.command, bytes_in=0, bytes_out=0,
-                    http_status=code, outcome=status, reason=reason)
+                    method=self.command, http_status=code,
+                    outcome="failure", reason=reason,
+                    close_reason="unknown",
+                    connect_ms=connect_ms,
+                    duration_ms=(time.perf_counter() - start) * 1000.0)
                 self.send_response(code)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
@@ -402,55 +805,120 @@ def make_handler(state: ProxyState):
                 self.end_headers()
                 self.wfile.write(body)
                 self.close_connection = True
-
-            if not state.is_allowed(dest_host, dest_port):
-                attempt = state.peek_attempt(trace_id, endpoint, self.command)
-                reject(403, "blocked", "not_allowlisted")
                 return
-            if not state.check_rate(dest_label):
-                attempt = state.peek_attempt(trace_id, endpoint, self.command)
-                reject(429, "rate_limited", "rate_limited")
-                return
-
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                attempt = state.peek_attempt(trace_id, endpoint, self.command)
-                reject(400, "failure", "malformed_header")
-                return
-            # Numbered only once the request will actually be forwarded.
-            attempt = state.next_attempt(trace_id, endpoint, self.command)
-            request_body = self.rfile.read(length) if length else b""
-
-            headers = {}
-            for key, value in self.headers.items():
-                lowered = key.lower()
-                if lowered in HOP_BY_HOP or lowered == "host":
-                    continue
-                if lowered in ("x-task-number", "x-strategy"):
-                    continue  # proxy control headers: used locally, never forwarded
-                headers[key] = value  # forwarded, never logged
-            headers["Host"] = dest_label
-            headers["X-Trace-Id"] = trace_id
-
-            status, http_status, response_body, resp_headers = "error", 502, b"", {}
-            try:
-                upstream = http.client.HTTPConnection(
-                    dest_host, dest_port, timeout=10)
-                upstream.request(self.command, endpoint,
-                                 body=request_body or None, headers=headers)
-                resp = upstream.getresponse()
-                response_body = resp.read()
-                http_status = resp.status
-                status = "success" if 200 <= http_status < 400 else "failure"
-                resp_headers = dict(resp.getheaders())
-                upstream.close()
             except Exception:
+                # Logged before the client is answered: everything about
+                # this row is already known, so no reader has to wait.
+                duration_ms = (time.perf_counter() - start) * 1000.0
+                db_module.log_attempt(
+                    state.conn, trace_id=trace_id, task_number=task_number,
+                    attempt=attempt, strategy=strategy, status="error",
+                    latency_seconds=duration_ms / 1000.0,
+                    retry_reason=_retry_reason(attempt),
+                    dest_host=dest_label, endpoint=endpoint,
+                    method=self.command, bytes_in=bytes_tx, bytes_out=0,
+                    http_status=502, outcome="allowed", reason="",
+                    bytes_tx=bytes_tx, bytes_rx=0,
+                    close_reason="upstream_reset", connect_ms=connect_ms,
+                    duration_ms=duration_ms)
                 response_body = b"Bad Gateway\n"
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.send_header("X-Trace-Id", trace_id)
+                self.end_headers()
+                self.wfile.write(response_body)
+                self.close_connection = True
+                return
 
-            latency = time.perf_counter() - start
-            input_tokens = _usage_input_tokens(
-                response_body, resp_headers.get("Content-Type", ""))
+            upstream_length = resp_headers.get("Content-Length")
+            try:
+                upstream_length = (int(upstream_length)
+                                   if upstream_length is not None else None)
+            except ValueError:
+                upstream_length = None
+            # Small bodies stay buffered: the row (usage included) is
+            # logged before the client sees the response, as before. Big
+            # or length-unknown bodies stream in chunks instead, and their
+            # row lands once the stream ends — readers must allow for that.
+            buffered = (upstream_length is not None
+                        and upstream_length <= MAX_BUFFERED_RESPONSE_BYTES)
+            if buffered:
+                response_body = resp.read()
+                upstream.close()
+                bytes_rx = len(response_body)
+                duration_ms = (time.perf_counter() - start) * 1000.0
+                input_tokens = _usage_input_tokens(
+                    response_body, resp_headers.get("Content-Type", ""))
+                db_module.log_attempt(
+                    state.conn, trace_id=trace_id, task_number=task_number,
+                    attempt=attempt, strategy=strategy, status=status,
+                    latency_seconds=duration_ms / 1000.0,
+                    input_tokens=input_tokens, cost_dollars=0.0,
+                    retry_reason=_retry_reason(attempt),
+                    dest_host=dest_label, endpoint=endpoint,
+                    method=self.command, bytes_in=bytes_tx,
+                    bytes_out=bytes_rx, http_status=http_status,
+                    outcome="allowed", reason="",
+                    bytes_tx=bytes_tx, bytes_rx=bytes_rx,
+                    close_reason=close_reason, connect_ms=connect_ms,
+                    duration_ms=duration_ms)
+                self.send_response(http_status)
+                for key, value in resp_headers.items():
+                    if (key.lower() in HOP_BY_HOP
+                            or key.lower() == "content-length"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(bytes_rx))
+                self.send_header("X-Trace-Id", trace_id)
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(response_body)
+                return
+
+            # Headers first, then the body in chunks, so streams and big
+            # downloads start arriving instead of buffering whole.
+            self.send_response(http_status)
+            for key, value in resp_headers.items():
+                if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
+                    continue
+                self.send_header(key, value)
+            if upstream_length is not None:
+                self.send_header("Content-Length", str(upstream_length))
+            else:
+                self.close_connection = True  # close-delimited: no length known
+            self.send_header("X-Trace-Id", trace_id)
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    while True:
+                        # Framed bodies (length or chunked) arrive piece by
+                        # piece through read. A close-delimited body has no
+                        # frame, so read would wait for EOF instead of
+                        # returning what is here; read1 takes what is
+                        # buffered and arrived, including bytes the header
+                        # read already pulled into the response buffer.
+                        # Idle over 10 s on the upstream socket ends the
+                        # stream (caught below as upstream_reset).
+                        if resp.chunked or upstream_length is not None:
+                            piece = resp.read(RELAY_CHUNK_BYTES)
+                        else:
+                            piece = resp.fp.read1(RELAY_CHUNK_BYTES)
+                        if not piece:
+                            break
+                        bytes_rx += len(piece)
+                        self.wfile.write(piece)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    close_reason = "client_eof"
+                    status = "failure"
+                except Exception:
+                    close_reason = "upstream_reset"
+                    status = "failure"
+            upstream.close()
+
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            input_tokens = 0  # streamed bodies are never re-read for usage
             db_module.log_attempt(
                 state.conn,
                 trace_id=trace_id,
@@ -458,30 +926,24 @@ def make_handler(state: ProxyState):
                 attempt=attempt,
                 strategy=strategy,
                 status=status,
-                latency_seconds=latency,
+                latency_seconds=duration_ms / 1000.0,
                 input_tokens=input_tokens,
                 cost_dollars=0.0,
                 retry_reason=_retry_reason(attempt),
                 dest_host=dest_label,
                 endpoint=endpoint,
                 method=self.command,
-                bytes_in=len(request_body),
-                bytes_out=len(response_body),
+                bytes_in=bytes_tx,
+                bytes_out=bytes_rx,
                 http_status=http_status,
                 outcome="allowed",
                 reason="",
+                bytes_tx=bytes_tx,
+                bytes_rx=bytes_rx,
+                close_reason=close_reason,
+                connect_ms=connect_ms,
+                duration_ms=duration_ms,
             )
-
-            self.send_response(http_status)
-            for key, value in resp_headers.items():
-                if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
-                    continue
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(response_body)))
-            self.send_header("X-Trace-Id", trace_id)
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(response_body)
 
         do_GET = _handle
         do_POST = _handle

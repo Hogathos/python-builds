@@ -4,7 +4,15 @@ Table `attempts` (v0.3 columns plus M1 proxy columns):
   id, trace_id, task_number, attempt, strategy, status,
   latency_seconds, input_tokens, cost_dollars, retry_reason, created_at,
   dest_host, endpoint, method, bytes_in, bytes_out, http_status,
-  outcome, reason
+  outcome, reason, bytes_tx, bytes_rx, close_reason, connect_ms,
+  duration_ms
+
+bytes_tx counts what the proxy sent toward the destination, bytes_rx
+what came back from it (bodies for plain HTTP, relayed bytes for a
+CONNECT tunnel; headers are never counted). close_reason says how the
+row ended: success, client_eof, upstream_reset, blocked_allowlist,
+rate_limited, relay_timeout, or unknown when none of those is known.
+connect_ms is the upstream connect time, duration_ms the whole row.
 
 No Authorization headers, API keys, or prompt/response bodies are stored.
 Cost/tokens are stored only when the caller supplies them; otherwise 0.
@@ -39,7 +47,12 @@ CREATE TABLE IF NOT EXISTS attempts (
     bytes_out INTEGER NOT NULL DEFAULT 0,
     http_status INTEGER,
     outcome TEXT NOT NULL DEFAULT '',
-    reason TEXT NOT NULL DEFAULT ''
+    reason TEXT NOT NULL DEFAULT '',
+    bytes_tx INTEGER NOT NULL DEFAULT 0,
+    bytes_rx INTEGER NOT NULL DEFAULT 0,
+    close_reason TEXT NOT NULL DEFAULT '',
+    connect_ms REAL,
+    duration_ms REAL
 );
 """
 
@@ -53,10 +66,18 @@ def init_db(path: str) -> sqlite3.Connection:
     # the ALTER fails duplicate-column and the re-check below lets us
     # continue. Anything else is re-raised, never masked.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
-    for name in ("outcome", "reason"):
+    for name, coltype in (
+        ("outcome", "TEXT NOT NULL DEFAULT ''"),
+        ("reason", "TEXT NOT NULL DEFAULT ''"),
+        ("bytes_tx", "INTEGER NOT NULL DEFAULT 0"),
+        ("bytes_rx", "INTEGER NOT NULL DEFAULT 0"),
+        ("close_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("connect_ms", "REAL"),
+        ("duration_ms", "REAL"),
+    ):
         if name not in existing:
             try:
-                conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+                conn.execute(f"ALTER TABLE attempts ADD COLUMN {name} {coltype}")
             except sqlite3.OperationalError:
                 cols = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
                 if name not in cols:
@@ -93,6 +114,11 @@ def log_attempt(
     created_at: str | None = None,
     outcome: str = "",
     reason: str = "",
+    bytes_tx: int = 0,
+    bytes_rx: int = 0,
+    close_reason: str = "",
+    connect_ms: float | None = None,
+    duration_ms: float | None = None,
 ) -> None:
     """Insert one metadata-only attempt row and commit it."""
     with _write_lock:
@@ -104,8 +130,9 @@ def log_attempt(
             (trace_id, task_number, attempt, strategy, status,
              latency_seconds, input_tokens, cost_dollars, retry_reason, created_at,
              dest_host, endpoint, method, bytes_in, bytes_out, http_status,
-             outcome, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             outcome, reason, bytes_tx, bytes_rx, close_reason, connect_ms,
+             duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trace_id,
@@ -126,6 +153,11 @@ def log_attempt(
                 http_status,
                 outcome,
                 reason,
+                bytes_tx,
+                bytes_rx,
+                close_reason,
+                connect_ms,
+                duration_ms,
             ),
         )
         conn.commit()
