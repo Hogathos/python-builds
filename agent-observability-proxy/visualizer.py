@@ -102,6 +102,8 @@ def group_traces(rows: list[sqlite3.Row]) -> list[dict]:
 def trace_verdict(trace: dict) -> str:
     steps = trace["steps"]
     succeeded = steps[-1]["status"] == "success"
+    if steps[-1]["status"] == "unknown":
+        return "UNKNOWN OUTCOME"
     if succeeded and len(steps) == 1:
         return "CLEAN SUCCESS"
     if succeeded:
@@ -154,12 +156,15 @@ def _split_endpoint(endpoint: object) -> tuple[str, int]:
 
 def _step_label(row: sqlite3.Row) -> str:
     ok = row["status"] == "success"
-    mark = "SUCCESS" if ok else "FAILED"
-    icon = "✅" if ok else "❌"
+    unknown = row["status"] == "unknown"
+    mark = "SUCCESS" if ok else ("UNKNOWN" if unknown else "FAILED")
+    icon = "✅" if ok else ("❓" if unknown else "❌")
     retry = " - RETRY" if row["attempt"] > 1 else ""
     path, arg_count = _split_endpoint(row["endpoint"] or "/")
     path = _clean(path)
-    method = _clean(row["method"] or "")
+    # A CONNECT row is one opaque tunnel, never one request.
+    method = ("CONNECT tunnel" if (row["method"] or "") == "CONNECT"
+              else _clean(row["method"] or ""))
     args = f" ({arg_count} args)" if arg_count else ""
     http = f" - HTTP {row['http_status']}" if row["http_status"] is not None else ""
     latency = float(row["latency_seconds"] or 0.0)
@@ -179,10 +184,13 @@ def _collapsed_label(collapsed: list) -> tuple[str, str]:
     cost = sum(float(r["cost_dollars"] or 0.0) for r in collapsed)
     latency = sum(float(r["latency_seconds"] or 0.0) for r in collapsed)
     all_failed = all(r["status"] != "success" for r in collapsed)
-    status = "all FAILED" if all_failed else "mixed"
+    all_unknown = all(r["status"] == "unknown" for r in collapsed)
+    status = ("outcome unknown" if all_unknown
+              else "all FAILED" if all_failed else "mixed")
     label = (f"↻ {count} collapsed retries - {status}<br/>"
              f"cost ${cost:.4f} - latency {latency:.2f}s")
-    cls = "failure" if all_failed else "success"
+    cls = ("unknown" if all_unknown
+           else "failure" if all_failed else "success")
     return (label, cls)
 
 
@@ -192,8 +200,10 @@ def _append_step_node(lines: list[str], prev: str, node: str, row) -> str:
         lines.append(f"        {prev} -->|retry| {node}")
     else:
         lines.append(f"        {prev} --> {node}")
-    lines.append(f"        class {node} "
-                 f"{'success' if row['status'] == 'success' else 'failure'}")
+    status = row["status"]
+    cls = ("success" if status == "success"
+           else "unknown" if status == "unknown" else "failure")
+    lines.append(f"        class {node} {cls}")
     return node
 
 
@@ -230,6 +240,7 @@ def build_mermaid(traces: list[dict]) -> str:
     lines += [
         "    classDef success fill:#1a7f37,color:#ffffff,stroke:#116329,stroke-width:2px",
         "    classDef failure fill:#cf222e,color:#ffffff,stroke:#82071e,stroke-width:2px",
+        "    classDef unknown fill:#6e7781,color:#ffffff,stroke:#424a53,stroke-width:2px",
     ]
     return "\n".join(lines)
 
@@ -283,7 +294,9 @@ def render_markdown(rows: list[sqlite3.Row], traces: list[dict]) -> str:
     ]
     for trace in traces:
         steps = trace["steps"]
-        final = "success" if steps[-1]["status"] == "success" else "failure"
+        final = steps[-1]["status"]
+        if final not in ("success", "unknown"):
+            final = "failure"
         out.append(
             f"| Trace {trace['label']} | {len(steps)} | "
             f"{sum(1 for s in steps if s['attempt'] > 1)} | "

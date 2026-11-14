@@ -22,7 +22,7 @@ ALLOWED_KEYS = {
     "created_at", "dest_host", "endpoint", "method", "bytes_in",
     "bytes_out", "bytes_tx", "bytes_rx", "close_reason", "connect_ms",
     "duration_ms", "http_status", "outcome", "reason", "attempt_count",
-    "cost", "cost_wasted", "cost_line",
+    "tunnels", "cost", "cost_wasted", "cost_line",
 }
 
 

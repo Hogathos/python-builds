@@ -539,6 +539,8 @@ class NetworkingFundamentalsTest(unittest.TestCase):
         for key in ("bytes_tx", "bytes_rx", "close_reason",
                     "connect_ms", "duration_ms"):
             self.assertIn(key, by_trace["trace-chunked-1"])
+        self.assertIn("tunnels", by_trace["trace-tunnel-1"])
+        self.assertEqual(by_trace["trace-tunnel-1"]["tunnels"], 1)
         detail = api_module.get_trace("trace-chunked-1")
         for key in ("bytes_tx", "bytes_rx", "close_reason",
                     "connect_ms", "duration_ms"):

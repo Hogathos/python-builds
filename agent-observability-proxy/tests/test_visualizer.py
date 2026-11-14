@@ -144,6 +144,27 @@ class VisualizerV2Test(unittest.TestCase):
         self.assertEqual(h["total_attempts"], 10)
         self.assertEqual(h["total_retries"], 9)
 
+    def test_unknown_status_renders_unknown_never_failed(self):
+        db_module.log_attempt(
+            self.conn, trace_id="demo-trace-quiet", task_number=9,
+            attempt=1, status="unknown", latency_seconds=30.0,
+            dest_host="127.0.0.1:18081", endpoint="127.0.0.1:18081",
+            method="CONNECT", close_reason="relay_timeout")
+        rows = visualizer.fetch_demo_attempts(self.conn)
+        traces = visualizer.group_traces(rows)
+        quiet = [t for t in traces if t["steps"][-1]["trace_id"]
+                 == "demo-trace-quiet"]
+        self.assertEqual(len(quiet), 1)
+        self.assertEqual(visualizer.trace_verdict(quiet[0]),
+                         "UNKNOWN OUTCOME")
+        label = visualizer._step_label(quiet[0]["steps"][0])
+        self.assertIn("UNKNOWN", label)
+        self.assertNotIn("FAILED", label)
+        self.assertIn("CONNECT tunnel", label)
+        md = visualizer.render_markdown(rows, traces)
+        self.assertIn("UNKNOWN OUTCOME", md)
+        self.assertIn("unknown", md)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,9 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("allowBlockCell", body)
         self.assertIn("allowhint", body)
         self.assertIn("closeWords", body)
+        self.assertIn("number of requests unknown", body)
+        self.assertIn("Inside this tunnel", body)
+        self.assertIn("msWords", body)
 
     def test_nothing_is_cached(self):
         # This sandbox blocks every listen() call, including the one the

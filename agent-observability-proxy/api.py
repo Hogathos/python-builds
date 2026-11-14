@@ -259,7 +259,13 @@ function updateRunRow(tr, t) {
   c[8].textContent = t.bytes_in;
   c[9].textContent = t.bytes_out;
   c[10].textContent = t.latency_seconds;
-  c[11].textContent = t.attempt_count;
+  // The count is log rows. For a pure-tunnel trace that is the
+  // tunnel count, so label it — never a per-request count.
+  if (isTunnel(t) && t.tunnels === t.attempt_count) {
+    c[11].textContent = t.tunnels + (t.tunnels === 1 ? " tunnel" : " tunnels");
+  } else {
+    c[11].textContent = t.attempt_count;
+  }
 }
 function outcomeWords(t) {
   if (t.outcome === "blocked") return "blocked by the allowlist";
@@ -271,10 +277,19 @@ function outcomeWords(t) {
 function isTunnel(t) {
   return t.method === "CONNECT";
 }
+function msWords(v) {
+  if (v === null || v === undefined) return "unknown";
+  return Number(v).toFixed(0) + " ms";
+}
 function runSummary(t) {
   if (isTunnel(t)) {
     return "Tunnel to " + t.endpoint + " — 1 tunnel (" +
-      outcomeWords(t) + "), contents not visible.";
+      outcomeWords(t) + "), contents not visible. " +
+      "Sent " + t.bytes_tx + " bytes, received " + t.bytes_rx + " bytes. " +
+      "Connected in " + msWords(t.connect_ms) + ", total " +
+      msWords(t.duration_ms) + ". " +
+      "Ended: " + (t.close_reason || "unknown") + ". " +
+      "Inside this tunnel: number of requests unknown, not guessed.";
   }
   return "Tried " + t.method + " " + t.dest_host + t.endpoint +
     " — " + outcomeWords(t) + ".";
@@ -461,12 +476,16 @@ def list_traces(limit: int = 20) -> dict:
         ).fetchall()
         by_trace = {}
         for r in conn.execute(
-            "SELECT trace_id, dest_host, outcome, status, cost_dollars FROM attempts"
+            "SELECT trace_id, dest_host, outcome, status, cost_dollars,"
+            " method FROM attempts"
         ):
             by_trace.setdefault(r["trace_id"], []).append(r)
         traces = []
         for r in rows:
             d = dict(r)
+            d["tunnels"] = sum(
+                1 for a in by_trace.get(d["trace_id"], [])
+                if a["method"] == "CONNECT")
             summary = summarize_costs(by_trace.get(d["trace_id"], []))
             d["cost"] = summary["cost"]
             d["cost_wasted"] = summary["wasted"]
