@@ -27,3 +27,7 @@ cd agent-observability-proxy
 ```
 
 Replace the folder name for other projects; each project documents its own test command in its README.
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
