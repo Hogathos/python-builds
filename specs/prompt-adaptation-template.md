@@ -1,5 +1,11 @@
 # Prompt adaptation template
 
+Authorship: human approved, agent drafted
+Written by: agent, from Charles decisions, Nov 14-15, 2026
+AI written: yes, as an instruction template, not as a decision
+Human written: no, for this file only, decisions in graphs/ are human written
+
+
 Use this order, for every feature, in one prompt per task, in Main first, then one clean spec prompt to Muse Code. Layered sequences of loops, not a single prompt.
 
 ## 1. Problem
