@@ -1,5 +1,14 @@
 # Verify and Steer approve together, build Steer first
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 Date: 2026-11-14
 Status: decided, approval pending in words
 

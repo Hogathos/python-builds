@@ -1,5 +1,14 @@
 # Who writes done
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 Date: 2026-11-13, 19:11 EST
 Status: decided
 

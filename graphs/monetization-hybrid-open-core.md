@@ -1,5 +1,14 @@
 # Monetization hybrid open core
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 Date: 2026-11-15
 Status: decided, best practice assumed
 

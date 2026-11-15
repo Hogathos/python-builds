@@ -1,5 +1,14 @@
 # Iris decisions
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 A public graph of the decisions that made Iris. One file per decision. One idea per file. Plain words. Short sentences.
 
 This folder is the source of truth. Flywheel is a view of it, if used. The repo is the home.

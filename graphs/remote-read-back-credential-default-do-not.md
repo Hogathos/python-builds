@@ -1,5 +1,14 @@
 # Remote read back credential Default Do Not
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 Date: 2026-11-14
 Status: decided
 

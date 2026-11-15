@@ -1,5 +1,14 @@
 # Lightcone 15000 dollars 16 weeks finish funding
 
+Author: Hogathos
+Decided by: human
+Written by: human
+Filed by: CyberHog, agent, filing and formatting only
+AI written: no
+Human written: yes
+Tags: human-written, human-decided
+
+
 Date: submitted 2026-11-12, budget edited 2026-11-14
 Status: submitted, closes 2026-11-15, 23:59 AoE
 Application ID: f13afeac-b50a-488e-bb0f-e91ff7152f67
