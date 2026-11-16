@@ -154,6 +154,29 @@ class SteerPauseOneRunTest(unittest.TestCase):
             exc.read()
             return exc.code
 
+    def assert_tunnel_dead(self, sock):
+        """A cut tunnel carries no more bytes: EOF or error, never an echo.
+
+        After the proxy shuts a tunnel down, the client sees FIN (clean
+        EOF) or RST (error). Which one arrives first is TCP timing, so
+        neither is asserted alone; an echo is impossible either way, so
+        any echo fails. A stall fails loudly instead of passing quiet.
+        """
+        sock.settimeout(5)
+        try:
+            sock.sendall(b"ping-after-cut")
+        except socket.timeout:
+            self.fail("tunnel send timed out: cut did not take effect")
+        except OSError:
+            return
+        try:
+            data = sock.recv(65536)
+        except socket.timeout:
+            self.fail("tunnel recv timed out: cut did not take effect")
+        except OSError:
+            return
+        self.assertEqual(data, b"", "tunnel still flows after cut")
+
     def echo_roundtrip(self, sock, payload):
         """Send bytes through a tunnel, expect the same bytes back."""
         sock.sendall(payload)
@@ -201,10 +224,7 @@ class SteerPauseOneRunTest(unittest.TestCase):
             # method, outcome = paused, reason = human pause / Steer
             # pause, verdict = Unverified (never Correct, never
             # Incorrect from a pause alone). Metadata only.
-            with self.assertRaises((OSError, socket.timeout)):
-                sock1.settimeout(2)
-                sock1.sendall(b"run1-after-pause")
-                self.assertEqual(self.echo_roundtrip(sock1, b"run1-after-pause"), b"")
+            self.assert_tunnel_dead(sock1)
             pause_rows = [
                 r for r in self.rows_for(trace1)
                 if r["outcome"] == "paused"
