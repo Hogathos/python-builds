@@ -80,6 +80,17 @@ sandbox enforcement. Those are later, separate tests, separate prompts.
 
 ## Notes
 
+- 2026-11-16, Pause dest_host empty on CI run 67, one failing test.
+  Cause: pause_run journaled dest_host from the journal row lookup, but
+  open tunnels have no journal row yet, so the row came out empty and
+  the test asserting the live destination failed. Fix, same as the Red
+  button union rule: the live tunnel registry now carries each open
+  tunnel's destination label, and pause_run takes it live first,
+  journaled second, never empty for a live tunnel. Journal before cut
+  still holds: state save plus journal commit first, socket close
+  after. Redirect needs no fix: it journals the human-chosen target,
+  never a lookup. Verified with the Pause test 5 times in a row plus
+  the full suite 3 times in a row, no flakes.
 - 2026-11-16, `.pytest_cache/` access-denied warnings on Windows are
   pre-existing, not from this change. The cache directory predates this
   work, is git-ignored, and Windows denies the write. The suite still

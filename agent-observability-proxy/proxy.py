@@ -487,9 +487,20 @@ class ProxyState:
             return False
         if self.is_paused(trace_id):
             return True
+        with self._lock:
+            live = self._live.pop(trace_id, {})
+            live_dests = [dest for dest in live.values() if dest]
         last = db_module.last_attempt(self.conn, trace_id)
-        dest_host = last["dest_host"] if last else ""
-        endpoint = last["endpoint"] if last else ""
+        if live_dests:
+            # Live tunnel first: an open tunnel has no journal row yet,
+            # so the journal lookup would come back empty. Journaled
+            # destination second, never empty for a live tunnel.
+            dest_host = endpoint = live_dests[0]
+        elif last:
+            dest_host = last["dest_host"]
+            endpoint = last["endpoint"]
+        else:
+            dest_host = endpoint = ""
         method = last["method"] if last else ""
         now = datetime.datetime.now(
             datetime.timezone.utc).isoformat(timespec="seconds")
@@ -499,7 +510,6 @@ class ProxyState:
         with self._lock:
             self._paused[trace_id] = {"reason": reason, "created_at": now}
             self._verified.pop(trace_id, None)
-            live = self._live.pop(trace_id, set())
         for sock in live:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -800,17 +810,22 @@ class ProxyState:
                 "row missing in a fresh transaction",
                 "Run stopped, human reviews the claim")
 
-    def _register_live(self, trace_id: str, sock) -> None:
-        """Track one open tunnel socket under its Run, for Pause cuts."""
+    def _register_live(self, trace_id: str, sock, dest_label: str = "") -> None:
+        """Track one open tunnel socket under its Run, for Pause cuts.
+
+        The destination label rides along because an open tunnel has no
+        journal row yet: a later Pause must journal where the live Run
+        actually is, never an empty string.
+        """
         with self._lock:
-            self._live.setdefault(trace_id, set()).add(sock)
+            self._live.setdefault(trace_id, {})[sock] = dest_label
 
     def _unregister_live(self, trace_id: str, sock) -> None:
         """Forget a closed tunnel socket. Never raises."""
         with self._lock:
             live = self._live.get(trace_id)
             if live is not None:
-                live.discard(sock)
+                live.pop(sock, None)
                 if not live:
                     self._live.pop(trace_id, None)
 
@@ -990,7 +1005,7 @@ def make_handler(state: ProxyState):
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            state._register_live(trace_id, self.connection)
+            state._register_live(trace_id, self.connection, endpoint)
             status, bytes_in, bytes_out, close_reason = "success", 0, 0, "success"
             try:
                 bytes_in, bytes_out, close_reason = _relay(
