@@ -117,7 +117,11 @@ class LiveProxyPropertyBase(unittest.TestCase):
             ("127.0.0.1", 0), _EchoHandler)
         cls.echo_port = cls.echo.server_address[1]
         threading.Thread(target=cls.echo.serve_forever, daemon=True).start()
-        cls.proxy = proxy_module.serve("127.0.0.1", 0, cls.db_path)
+        # High rate limit: rate limiting has its own tests; these
+        # properties must never trip it, or a 429 would mask the 503
+        # cut refusal the assertions check for.
+        cls.proxy = proxy_module.serve(
+            "127.0.0.1", 0, cls.db_path, rate_limit=10000)
         cls.proxy_port = cls.proxy.server_address[1]
         threading.Thread(target=cls.proxy.serve_forever, daemon=True).start()
         cls.dest = f"127.0.0.1:{cls.echo_port}"
