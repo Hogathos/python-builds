@@ -28,8 +28,9 @@ DB_PATH = os.environ.get(
 # Price table: USD per forwarded request, keyed by destination host
 # (port stripped before lookup). Loopback is $0.00 because that traffic
 # never leaves the machine: no external API is called, so nothing can be
-# billed. Blocked, rate_limited, paused, and redirected attempts always
-# cost $0.00 for the same reason (never forwarded, zero bytes out). A nonzero cost
+# billed. Blocked, rate_limited, paused, redirected, stopped, and
+# verified attempts always cost $0.00: a Verify reads locally and never
+# forwards, so nothing can be billed. A nonzero cost
 # already recorded in the database (real API-reported usage) always wins
 # over this table. Any other destination is unknown: no price is guessed.
 # Add a row here only from a published vendor price page, and note the
@@ -44,7 +45,7 @@ PRICE_PER_REQUEST = {
 def attempt_cost(row) -> float | None:
     """USD for one attempt row, or None when the price is unknown."""
     if row["outcome"] in ("blocked", "rate_limited", "paused",
-                            "redirected"):
+                            "redirected", "stopped", "verified"):
         return 0.0
     if row["cost_dollars"]:
         return row["cost_dollars"]
@@ -186,6 +187,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <div class="stat">rate limited<b id="s-limited">&ndash;</b><small>slowed down</small></div>
 <div class="stat">paused<b id="s-paused">&ndash;</b><small>stopped runs, retry needs a fresh Verify</small></div>
 <div class="stat">redirected<b id="s-redirected">&ndash;</b><small>moved runs, retry needs a fresh Verify</small></div>
+<div class="stat">stopped<b id="s-stopped">&ndash;</b><small>all stopped, approval needed for a new Run</small></div>
+<div class="stat">verified<b id="s-verified">&ndash;</b><small>checked by read back</small></div>
 <div class="stat">successes<b id="s-success">&ndash;</b><small>completed</small></div>
 <div class="stat">average latency (seconds)<b id="s-lat">&ndash;</b><small>mean wait per try</small></div>
 <div class="stat">total cost<b id="s-cost">&ndash;</b><small>what all runs cost</small></div>
@@ -276,6 +279,10 @@ function outcomeWords(t) {
   if (t.outcome === "rate_limited") return "slowed down by the rate limit";
   if (t.outcome === "paused") return "paused, retry needs a fresh Verify";
   if (t.outcome === "redirected") return "redirected, retry needs a fresh Verify";
+  if (t.outcome === "stopped") return "stopped, approval needed for a new Run";
+  if (t.outcome === "verified" && t.status === "success") return "verified Correct";
+  if (t.outcome === "verified" && t.status === "failure") return "verified Incorrect";
+  if (t.outcome === "verified") return "unverified";
   if (!t.outcome) return "not recorded";
   if (t.status === "unknown") return "unverified";
   if (t.status === "success") return "allowed";
@@ -314,6 +321,8 @@ async function load() {
     document.getElementById("s-limited").textContent = s.rate_limited;
     document.getElementById("s-paused").textContent = s.paused;
     document.getElementById("s-redirected").textContent = s.redirected;
+    document.getElementById("s-stopped").textContent = s.stopped;
+    document.getElementById("s-verified").textContent = s.verified;
     document.getElementById("s-success").textContent = s.successes;
     document.getElementById("s-lat").textContent = s.avg_latency_seconds;
   document.getElementById("s-cost").textContent = (s.total_cost === null || s.total_cost === undefined) ? "unknown" : "$" + Number(s.total_cost).toFixed(2);
@@ -358,6 +367,8 @@ function closeWords(v) {
   if (v === "rate_limited") return "slowed down by the rate limit";
   if (v === "paused") return "paused";
   if (v === "redirected") return "redirected";
+  if (v === "stopped") return "stopped";
+  if (v === "verified") return "verified";
   if (v === "relay_timeout") return "tunnel went quiet past the timeout";
   if (v === "success") return "finished";
   return "unknown";
@@ -551,6 +562,8 @@ def stats() -> dict:
             "rate_limited": 0,
             "paused": 0,
             "redirected": 0,
+            "stopped": 0,
+            "verified": 0,
             "successes": 0,
             "avg_latency_seconds": 0.0,
         }
@@ -578,6 +591,8 @@ def stats() -> dict:
             "rate_limited": counts["rate_limited"],
             "paused": counts["paused"],
             "redirected": counts["redirected"],
+            "stopped": counts["stopped"],
+            "verified": counts["verified"],
             "successes": row[0] or 0,
             "avg_latency_seconds": row[1] or 0.0,
             "total_cost": summary["cost"],

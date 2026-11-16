@@ -63,6 +63,8 @@ def init_db(path: str) -> sqlite3.Connection:
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(PAUSED_RUNS_TABLE_SQL)
     conn.execute(REDIRECTED_RUNS_TABLE_SQL)
+    conn.execute(RED_BUTTON_TABLE_SQL)
+    conn.execute(RED_BUTTON_TRACES_TABLE_SQL)
     conn.commit()
     # M4 migration: add outcome/reason to a pre-M4 database in place.
     # Two processes can arrive here together; if a peer wins the race
@@ -219,11 +221,12 @@ def fetch_outcome_counts(conn) -> dict:
     attempts instead of silently dropping rows.
     """
     counts = {"allowed": 0, "blocked": 0, "rate_limited": 0,
-              "paused": 0, "redirected": 0, "other": 0}
+              "paused": 0, "redirected": 0, "stopped": 0,
+              "verified": 0, "other": 0}
     for outcome, n in conn.execute(
             "SELECT outcome, COUNT(*) FROM attempts GROUP BY outcome"):
-        if outcome in ("allowed", "blocked", "rate_limited",
-                       "paused", "redirected"):
+        if outcome in ("allowed", "blocked", "rate_limited", "paused",
+                       "redirected", "stopped", "verified"):
             counts[outcome] = n
         else:
             counts["other"] += n
@@ -320,6 +323,68 @@ def save_redirected(conn, trace_id: str, dest_host: str, reason: str,
             (trace_id, dest_host, reason, created_at),
         )
         conn.commit()
+
+
+RED_BUTTON_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS red_button_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def load_red_button(conn):
+    """Red button state that survives an Iris restart: never auto-lift.
+
+    Returns {"reason": ..., "created_at": ...} when the button was
+    pressed, else None. A restart loads this back, so every Run stays
+    stopped until a fresh human approval plus Verify lets a new Run
+    through. Old Runs never restart on their own.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT reason, created_at FROM red_button_state WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.row_factory = prev_factory
+
+
+def save_red_button(conn, reason: str, created_at: str) -> None:
+    """Record a Red button press. Human-only callers; never the agent."""
+    with _write_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO red_button_state "
+            "(id, reason, created_at) VALUES (1, ?, ?)",
+            (reason, created_at),
+        )
+        conn.commit()
+
+
+RED_BUTTON_TRACES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS red_button_traces (
+    trace_id TEXT PRIMARY KEY
+);
+"""
+
+
+def save_red_button_traces(conn, trace_ids) -> None:
+    """Record which Runs the Red button stopped. Old Runs stay stopped."""
+    with _write_lock:
+        conn.executemany(
+            "INSERT OR IGNORE INTO red_button_traces (trace_id) VALUES (?)",
+            [(trace_id,) for trace_id in trace_ids],
+        )
+        conn.commit()
+
+
+def load_red_button_traces(conn) -> set:
+    """Trace ids stopped by the Red button. Never restarted alone."""
+    rows = conn.execute("SELECT trace_id FROM red_button_traces").fetchall()
+    return {row[0] for row in rows}
 
 
 def last_attempt(conn, trace_id: str):

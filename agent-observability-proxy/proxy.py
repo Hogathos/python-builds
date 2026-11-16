@@ -46,6 +46,15 @@ the old destination, never forward to the refused one. A retry on the
 new destination without a fresh Verify is blocked and journaled; after
 a fresh Verify it is allowed and journaled. Redirect rows are metadata
 only and always cost $0.00.
+
+Steer Red button: a human stops all Runs at once. Every known Run gets
+a stop row first (outcome stopped, verdict unknown), then every live
+tunnel is cut. No Run keeps working, paused or flowing. After the
+button, any traffic without a fresh human approval plus Verify is
+refused and journaled: no fail-open to new Runs, and old Runs never
+restart on their own. A fresh approval plus Verify lets a new Run
+through; old Runs stay stopped. The journal is only added to, never
+deleted. Stop rows are metadata only and always cost $0.00.
 """
 from __future__ import annotations
 
@@ -57,6 +66,7 @@ import json
 import os
 import select
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -259,6 +269,13 @@ class ProxyState:
         # (survives restart, never silently undone).
         self._redirects: dict[str, dict] = db_module.load_redirected(
             self.conn)
+        # Steer Red button: global stop (survives restart, never
+        # auto-lifted), the stopped trace set (old Runs never restart
+        # alone), plus fresh human approvals for new Runs.
+        self._stopped: dict | None = db_module.load_red_button(self.conn)
+        self._stopped_traces: set = db_module.load_red_button_traces(
+            self.conn)
+        self._approved: dict[str, str] = {}
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
         self._attempts: dict[tuple[str, str, str], list[float]] = {}
@@ -364,14 +381,17 @@ class ProxyState:
     def steer_cut(self, trace_id: str):
         """(outcome, reason) when this Run was steered mid-flight.
 
-        Returns None when the Run was not paused or redirected, so a
-        normal tunnel close keeps its own status and outcome.
+        Returns None when the Run was not paused, redirected, or
+        Red-button stopped, so a normal tunnel close keeps its own
+        status and outcome.
         """
         with self._lock:
             if trace_id in self._paused:
                 return ("paused", self._paused[trace_id]["reason"])
             if trace_id in self._redirects:
                 return ("redirected", self._redirects[trace_id]["reason"])
+            if self._stopped is not None:
+                return ("stopped", self._stopped["reason"])
             return None
 
     def redirect_run(self, trace_id: str, new_dest: str,
@@ -487,18 +507,110 @@ class ProxyState:
                 pass
         return True
 
+    def red_button(self, reason: str = "human red button") -> bool:
+        """Stop all Runs at once. Journal first, then cut everything.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route, so proxied agent traffic cannot call it. Every known
+        Run gets a stop row first (outcome stopped, status unknown:
+        Unverified explicitly), then every live tunnel on every Run is
+        cut. Paused Runs get a stop row too. The journal is only added
+        to, never deleted. Fresh approvals and Verifies are cleared, so
+        nothing restarts without a fresh human word. Every press is
+        journaled: audit everything, never silently.
+        """
+        if reason not in ("human red button", "Steer red button"):
+            return False
+        journaled = [row[0] for row in self.conn.execute(
+            "SELECT DISTINCT trace_id FROM attempts").fetchall()]
+        with self._lock:
+            # Open tunnels have no journal row yet: their rows land when
+            # the tunnels end. They are known Runs too, and stop as well.
+            live_only = [t for t in self._live if t not in journaled]
+        traces = journaled + live_only
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.save_red_button(self.conn, reason, now)
+        db_module.save_red_button_traces(self.conn, traces)
+        with self._lock:
+            self._stopped_traces.update(traces)
+        for trace_id in traces:
+            last = db_module.last_attempt(self.conn, trace_id)
+            dest_host = last["dest_host"] if last else ""
+            endpoint = last["endpoint"] if last else ""
+            method = last["method"] if last else ""
+            self._control_row(trace_id, method, dest_host, endpoint,
+                              "unknown", "stopped", reason, "stopped")
+        with self._lock:
+            self._stopped = {"reason": reason, "created_at": now}
+            self._verified.clear()
+            self._approved.clear()
+            live = [sock for socks in self._live.values() for sock in socks]
+            self._live.clear()
+        for sock in live:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return True
+
+    def approve_run(self, trace_id: str, done_clause=None) -> bool:
+        """Fresh human approval for a NEW Run after Red button.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route. Refuses (False, no row) when the done clause is
+        missing or not human-approved, or when the trace was stopped by
+        the button: old Runs stay stopped and never restart on their
+        own. Otherwise journals the approval and records it. Approval
+        alone moves no bytes; a fresh Verify must still follow.
+        """
+        if (not isinstance(done_clause, dict)
+                or done_clause.get("approved_by") != "human"
+                or not done_clause.get("read_back")):
+            return False
+        with self._lock:
+            if trace_id in self._stopped_traces:
+                return False
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        self._control_row(trace_id, "APPROVE", "", "",
+                          "unknown", "", "fresh approval recorded",
+                          "stopped")
+        with self._lock:
+            self._approved[trace_id] = now
+        return True
+
+    def red_gate(self, trace_id: str) -> bool:
+        """True when this trace may move bytes right now.
+
+        With no Red button pressed, everything passes. After the button,
+        only a trace with a fresh human approval plus a fresh Verify
+        passes. Old and unseen Runs are refused until then: no fail-open.
+        """
+        with self._lock:
+            if self._stopped is None:
+                return True
+            approved_at = self._approved.get(trace_id)
+            verified_at = self._verified.get(trace_id)
+            return bool(approved_at and verified_at
+                        and verified_at >= approved_at)
+
     def verify_run(self, trace_id: str, done_clause=None) -> bool:
-        """Record a fresh human Verify for a paused or redirected Run.
+        """Record a fresh human Verify for a paused, redirected, or
+        Red-button-approved Run.
 
         Refuses (False, no row) when the Run is neither paused nor
-        redirected, when the done clause is missing or not
-        human-approved, or when the journal read finds nothing to
-        verify. Otherwise journals the Verify and stamps it: only a
-        Verify after the pause or redirect unblocks a retry.
+        redirected nor approved after Red button, when the done clause
+        is missing or not human-approved, or when the journal read finds
+        nothing to verify. Otherwise journals the Verify and stamps it:
+        only a Verify after the pause, redirect, or fresh approval
+        unblocks a retry.
         """
         with self._lock:
             gated = (trace_id in self._paused
-                     or trace_id in self._redirects)
+                     or trace_id in self._redirects
+                     or (self._stopped is not None
+                         and trace_id in self._approved))
         if not gated:
             return False
         if (not isinstance(done_clause, dict)
@@ -517,38 +629,49 @@ class ProxyState:
         return True
 
     def retry_run(self, trace_id: str) -> tuple:
-        """Retry gate for a paused or redirected Run: blocked until fresh.
+        """Retry gate: blocked until fresh, everywhere it applies.
 
-        Returns (allowed, reason). A blocked retry is journaled with
-        reason "verify required before retry". An allowed retry (fresh
-        Verify after the pause or redirect) resumes the Run and journals
-        that. A pause is forgotten on resume; a redirect stays on its
-        human-chosen destination, and the Verify stamp stays with it so
-        later retries on that destination keep working until the next
-        redirect. A Run that is neither paused nor redirected is not
-        gated here: (True, "not paused"), no row.
+        Returns (allowed, reason). A blocked retry is journaled: reason
+        "verify required before retry", or "red button stopped" for an
+        old Run with no fresh approval. An allowed retry (fresh Verify
+        after the pause, redirect, or Red-button approval) resumes the
+        Run and journals that. A pause is forgotten on resume; a redirect
+        stays on its human-chosen destination, and the Verify stamp stays
+        with it so later retries keep working until the next redirect; a
+        Red-button approval and Verify stand until the next press. A Run
+        that is gated nowhere is not gated here: (True, "not paused") or
+        (True, "approved") for a fresh Red-button Run, no row.
         """
         with self._lock:
+            approved_at = self._approved.get(trace_id)
+            verified_at = self._verified.get(trace_id)
             if trace_id in self._paused:
                 kind, since = "paused", self._paused[trace_id]["created_at"]
             elif trace_id in self._redirects:
                 kind = "redirected"
                 since = self._redirects[trace_id]["created_at"]
+            elif self._stopped is not None and not (
+                    approved_at and verified_at and verified_at >= approved_at):
+                kind, since = "stopped", self._stopped["created_at"]
             else:
+                if self._stopped is not None:
+                    return True, "approved"
                 return True, "not paused"
-            verified_at = self._verified.get(trace_id)
         last = db_module.last_attempt(self.conn, trace_id)
         dest_host = last["dest_host"] if last else ""
         endpoint = last["endpoint"] if last else ""
         # The stamp can only exist when a Verify landed after this
-        # pause or redirect (a new one clears it), so presence means
-        # fresh. The timestamp check is a backstop, same-second stamps
-        # included.
+        # pause, redirect, or Red-button press (a new one clears it), so
+        # presence means fresh. The timestamp check is a backstop,
+        # same-second stamps included.
         if not verified_at or verified_at < since:
+            if kind == "stopped" and not approved_at:
+                reason = "red button stopped"
+            else:
+                reason = "verify required before retry"
             self._control_row(trace_id, "RETRY", dest_host, endpoint,
-                              "unknown", "blocked",
-                              "verify required before retry", kind)
-            return False, "verify required before retry"
+                              "unknown", "blocked", reason, kind)
+            return False, reason
         if kind == "paused":
             db_module.clear_paused(self.conn, trace_id)
         now = datetime.datetime.now(
@@ -560,9 +683,122 @@ class ProxyState:
             if kind == "paused":
                 self._paused.pop(trace_id, None)
                 self._verified.pop(trace_id, None)
-            else:
+            elif kind == "redirected":
                 self._verified[trace_id] = now
         return True, "retry allowed after verify"
+
+    def verify_read_back(self, trace_id: str, claim,
+                           done_clause=None):
+        """Verify a claim by independent local read-back. Journal first.
+
+        Returns (verdict, card) with verdict one of Correct, Incorrect,
+        Unverified. Local file and SQLite only: reads the real effect
+        after close/fsync and COMMIT, never the agent's own word. No
+        scores, no LLM, no percentages. The call row is journaled before
+        anything is read; the verdict row follows; a stop follows an
+        Incorrect verdict. Verdict and retry permission stay separate:
+        nothing here stamps a Verify or allows a retry.
+        """
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        key = (claim.get("idempotency_key", "-")
+               if isinstance(claim, dict) else "-")
+        self._control_row(trace_id, "VERIFY", "", "", "unknown",
+                          "verified", f"verify call {key}", "verified")
+        verdict, what_read, source, why, nxt = self._read_back(claim,
+                                                               done_clause)
+        status = {"Correct": "success", "Incorrect": "failure",
+                  "Unverified": "unknown"}[verdict]
+        self._control_row(trace_id, "VERIFY", "", "", status,
+                          "verified", f"verify {verdict}", "verified")
+        if verdict == "Incorrect":
+            self.pause_run(trace_id, reason="Steer pause")
+        card = {"claim": claim, "what_read": what_read, "source": source,
+                "as_of": now, "verdict": verdict, "why": why, "next": nxt}
+        return verdict, card
+
+    def _read_back(self, claim, done_clause):
+        """Independent read of the claimed effect. No journal here.
+
+        Returns (verdict, what_read, source, why, next). Anything that
+        cannot be read, has no approved done, or is remote with no local
+        proof is Unverified, never Incorrect: addressing and credential
+        errors are excluded, not contradicted.
+        """
+        if (not isinstance(done_clause, dict)
+                or done_clause.get("approved_by") != "human"
+                or not done_clause.get("read_back")):
+            return ("Unverified", "no read attempted",
+                    "journal: no approved done clause",
+                    "no approved done clause",
+                    "human approves the done clause, then Verify again")
+        if not isinstance(claim, dict):
+            return ("Unverified", "no read attempted",
+                    "journal: claim is not a read profile",
+                    "no read profile for this claim",
+                    "human approves a read profile, then Verify again")
+        kind = claim.get("kind")
+        if kind == "local-file":
+            return self._read_back_file(claim)
+        if kind == "sqlite":
+            return self._read_back_sqlite(claim)
+        return ("Unverified", "no read attempted",
+                "journal: remote effect with no local proof",
+                "remote with no local proof",
+                "human confirms, or add a local proof, then Verify again")
+
+    def _read_back_file(self, claim):
+        """Strong local file read: the bytes on disk, after fsync."""
+        path = claim.get("path", "")
+        expected = claim.get("expected_text")
+        what = f"local file {path}"
+        try:
+            with open(path, "r") as handle:
+                actual = handle.read()
+        except FileNotFoundError:
+            return ("Incorrect", what, "local filesystem",
+                    "file does not exist",
+                    "Run stopped, human reviews the claim")
+        except OSError:
+            return ("Unverified", what, "local filesystem",
+                    "file could not be read",
+                    "human checks the file, then Verify again")
+        if actual == expected:
+            return ("Correct", what, "local filesystem",
+                    "file text matched the claim",
+                    "done, keep the journal")
+        return ("Incorrect", what, "local filesystem",
+                "file text contradicted the claim",
+                "Run stopped, human reviews the claim")
+
+    def _read_back_sqlite(self, claim):
+        """Strong SQLite read: SELECT in a fresh txn, after COMMIT."""
+        path = claim.get("db", "")
+        what = f"local SQLite {path}"
+        if not path or not os.path.exists(path):
+            return ("Incorrect", what, "local SQLite",
+                    "database file does not exist",
+                    "Run stopped, human reviews the claim")
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                rows = conn.execute(
+                    claim.get("sql", ""),
+                    claim.get("params", []) or []).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return ("Unverified", what, "local SQLite",
+                    "read failed, not a contradiction",
+                    "human checks the database, then Verify again")
+        actual = [list(row) for row in rows]
+        if actual == (claim.get("expected_rows") or []):
+            return ("Correct", what, "local SQLite",
+                    "row matched the claim in a fresh transaction",
+                    "done, keep the journal")
+        return ("Incorrect", what, "local SQLite",
+                "row missing in a fresh transaction",
+                "Run stopped, human reviews the claim")
 
     def _register_live(self, trace_id: str, sock) -> None:
         """Track one open tunnel socket under its Run, for Pause cuts."""
@@ -676,6 +912,19 @@ def make_handler(state: ProxyState):
                     close_reason=close_reason, connect_ms=connect_ms,
                     duration_ms=duration_ms)
 
+            if not state.red_gate(trace_id):
+                # Red button is on and this trace has no fresh human
+                # approval plus Verify: no new tunnel. Unknown, never
+                # Correct. Nothing fails open.
+                attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
+                log_connect("unknown", "stopped",
+                            "approval required after red button",
+                            503, 0, 0, "stopped")
+                self.send_response(503)
+                self.send_header("X-Trace-Id", trace_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if not state.is_allowed(dest_host, dest_port):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
                 log_connect("blocked", "blocked", "not_allowlisted", 403,
@@ -1001,6 +1250,18 @@ def make_handler(state: ProxyState):
                     b"WebSocket needs CONNECT: send a CONNECT tunnel, "
                     b"not Upgrade on plain HTTP\n",
                     trace_id=trace_id)
+                return
+            if not state.red_gate(trace_id):
+                # Red button is on and this trace has no fresh human
+                # approval plus Verify: nothing forwards. Unknown, never
+                # Correct. Nothing fails open.
+                self._refused(
+                    503, "unknown", "approval required after red button",
+                    dest_label, endpoint,
+                    b"stopped: Red button is on, "
+                    b"a fresh approval plus Verify is needed\n",
+                    trace_id=trace_id, close_reason="stopped",
+                    outcome="stopped")
                 return
             if not state.is_allowed(dest_host, dest_port):
                 reject(403, "blocked", "not_allowlisted",

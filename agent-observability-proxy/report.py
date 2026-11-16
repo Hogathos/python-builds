@@ -28,6 +28,8 @@ def main():
           f"rate_limited={outcomes['rate_limited']} "
           f"paused={outcomes['paused']} "
           f"redirected={outcomes['redirected']} "
+          f"stopped={outcomes['stopped']} "
+          f"verified={outcomes['verified']} "
           f"other={outcomes['other']}")
     print(f"attempts={attempts} traces={totals['traces'] or 0} "
           f"successes={successes} success_rate={rate:.1f}% "
