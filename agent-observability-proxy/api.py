@@ -28,11 +28,12 @@ DB_PATH = os.environ.get(
 # Price table: USD per forwarded request, keyed by destination host
 # (port stripped before lookup). Loopback is $0.00 because that traffic
 # never leaves the machine: no external API is called, so nothing can be
-# billed. Blocked and rate_limited attempts always cost $0.00 for the same
-# reason (never forwarded, zero bytes out). A nonzero cost already recorded
-# in the database (real API-reported usage) always wins over this table.
-# Any other destination is unknown: no price is guessed. Add a row here
-# only from a published vendor price page, and note the source.
+# billed. Blocked, rate_limited, paused, and redirected attempts always
+# cost $0.00 for the same reason (never forwarded, zero bytes out). A nonzero cost
+# already recorded in the database (real API-reported usage) always wins
+# over this table. Any other destination is unknown: no price is guessed.
+# Add a row here only from a published vendor price page, and note the
+# source.
 PRICE_PER_REQUEST = {
     "127.0.0.1": 0.0,
     "localhost": 0.0,
@@ -42,7 +43,8 @@ PRICE_PER_REQUEST = {
 
 def attempt_cost(row) -> float | None:
     """USD for one attempt row, or None when the price is unknown."""
-    if row["outcome"] in ("blocked", "rate_limited"):
+    if row["outcome"] in ("blocked", "rate_limited", "paused",
+                            "redirected"):
         return 0.0
     if row["cost_dollars"]:
         return row["cost_dollars"]
@@ -182,6 +184,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <div class="stat">allowed<b id="s-allowed">&ndash;</b><small>let through</small></div>
 <div class="stat">blocked<b id="s-blocked">&ndash;</b><small>stopped by the allowlist</small></div>
 <div class="stat">rate limited<b id="s-limited">&ndash;</b><small>slowed down</small></div>
+<div class="stat">paused<b id="s-paused">&ndash;</b><small>stopped runs, retry needs a fresh Verify</small></div>
+<div class="stat">redirected<b id="s-redirected">&ndash;</b><small>moved runs, retry needs a fresh Verify</small></div>
 <div class="stat">successes<b id="s-success">&ndash;</b><small>completed</small></div>
 <div class="stat">average latency (seconds)<b id="s-lat">&ndash;</b><small>mean wait per try</small></div>
 <div class="stat">total cost<b id="s-cost">&ndash;</b><small>what all runs cost</small></div>
@@ -255,7 +259,7 @@ function updateRunRow(tr, t) {
   c[4].textContent = t.endpoint;
   c[5].textContent = t.dest_host;
   c[6].textContent = outcomeWords(t);
-  c[7].textContent = t.status;
+  c[7].textContent = t.status === "unknown" ? "unverified" : t.status;
   c[8].textContent = t.bytes_in;
   c[9].textContent = t.bytes_out;
   c[10].textContent = t.latency_seconds;
@@ -270,7 +274,10 @@ function updateRunRow(tr, t) {
 function outcomeWords(t) {
   if (t.outcome === "blocked") return "blocked by the allowlist";
   if (t.outcome === "rate_limited") return "slowed down by the rate limit";
+  if (t.outcome === "paused") return "paused, retry needs a fresh Verify";
+  if (t.outcome === "redirected") return "redirected, retry needs a fresh Verify";
   if (!t.outcome) return "not recorded";
+  if (t.status === "unknown") return "unverified";
   if (t.status === "success") return "allowed";
   return "failed";
 }
@@ -305,6 +312,8 @@ async function load() {
     document.getElementById("s-allowed").textContent = s.allowed;
     document.getElementById("s-blocked").textContent = s.blocked;
     document.getElementById("s-limited").textContent = s.rate_limited;
+    document.getElementById("s-paused").textContent = s.paused;
+    document.getElementById("s-redirected").textContent = s.redirected;
     document.getElementById("s-success").textContent = s.successes;
     document.getElementById("s-lat").textContent = s.avg_latency_seconds;
   document.getElementById("s-cost").textContent = (s.total_cost === null || s.total_cost === undefined) ? "unknown" : "$" + Number(s.total_cost).toFixed(2);
@@ -347,6 +356,8 @@ function closeWords(v) {
   if (v === "upstream_reset") return "destination failed";
   if (v === "blocked_allowlist") return "blocked by the allowlist";
   if (v === "rate_limited") return "slowed down by the rate limit";
+  if (v === "paused") return "paused";
+  if (v === "redirected") return "redirected";
   if (v === "relay_timeout") return "tunnel went quiet past the timeout";
   if (v === "success") return "finished";
   return "unknown";
@@ -538,6 +549,8 @@ def stats() -> dict:
             "allowed": 0,
             "blocked": 0,
             "rate_limited": 0,
+            "paused": 0,
+            "redirected": 0,
             "successes": 0,
             "avg_latency_seconds": 0.0,
         }
@@ -563,6 +576,8 @@ def stats() -> dict:
             "allowed": counts["allowed"],
             "blocked": counts["blocked"],
             "rate_limited": counts["rate_limited"],
+            "paused": counts["paused"],
+            "redirected": counts["redirected"],
             "successes": row[0] or 0,
             "avg_latency_seconds": row[1] or 0.0,
             "total_cost": summary["cost"],

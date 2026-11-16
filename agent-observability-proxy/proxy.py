@@ -28,10 +28,29 @@ in the X-Trace-Id response header.
 Never logged: Authorization / API-key headers and request/response
 bodies. Token counts are recorded only when the upstream JSON response
 itself reports `usage`; cost is never invented (stays 0.0).
+
+Steer Pause one Run: a human pauses one Run by trace_id. The pause is
+journaled first (outcome paused, verdict unknown), then that Run's live
+tunnel is cut and its later traffic is refused. Other Runs are not
+touched. A retry without a fresh Verify is blocked and journaled;
+after a fresh Verify the retry is allowed and journaled. Pause rows
+are metadata only and always cost $0.00.
+
+Steer Redirect one Run: a human moves one Run to a new allowlisted
+loopback destination by trace_id. The redirect is journaled first
+(outcome redirected, verdict unknown), then the Run's live tunnel is
+cut and later traffic for that trace_id goes to the new destination.
+Other Runs keep their routes. A redirect to a non-allowlisted name is
+refused and journaled, and the Run stays where it was: never back to
+the old destination, never forward to the refused one. A retry on the
+new destination without a fresh Verify is blocked and journaled; after
+a fresh Verify it is allowed and journaled. Redirect rows are metadata
+only and always cost $0.00.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import http.client
 import ipaddress
 import json
@@ -231,6 +250,15 @@ class ProxyState:
         self.rate_window = float(rate_window)
         self.relay_timeout = float(relay_timeout)
         self._lock = threading.Lock()
+        # Steer Pause one Run: paused Runs by trace_id (survive restart,
+        # never auto-resume), fresh Verify stamps, live tunnel sockets.
+        self._paused: dict[str, dict] = db_module.load_paused(self.conn)
+        self._verified: dict[str, str] = {}
+        self._live: dict[str, set] = {}
+        # Steer Redirect one Run: human-chosen destination per trace_id
+        # (survives restart, never silently undone).
+        self._redirects: dict[str, dict] = db_module.load_redirected(
+            self.conn)
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
         self._attempts: dict[tuple[str, str, str], list[float]] = {}
@@ -310,6 +338,245 @@ class ProxyState:
             fresh = [t for t in self._attempts.get(key, [])
                      if now - t <= self.retry_window]
             return len(fresh) + 1
+
+    # -- Steer Pause one Run. Human-only: these are plain methods on the
+    # local proxy state, never an HTTP route, so proxied agent traffic
+    # cannot call them. Local-first, fail-closed: if Iris dies, the
+    # proxy is down and the agent stops, not continues. -------------
+
+    def is_paused(self, trace_id: str) -> bool:
+        """True when this Run is paused: nothing forwards for it."""
+        with self._lock:
+            return trace_id in self._paused
+
+    def pause_reason(self, trace_id: str) -> str:
+        """Why this Run is paused, or "paused" when it is not."""
+        with self._lock:
+            entry = self._paused.get(trace_id)
+            return entry["reason"] if entry else "paused"
+
+    def redirect_target(self, trace_id: str) -> str | None:
+        """Human-chosen destination label for this Run, or None."""
+        with self._lock:
+            entry = self._redirects.get(trace_id)
+            return entry["dest_host"] if entry else None
+
+    def steer_cut(self, trace_id: str):
+        """(outcome, reason) when this Run was steered mid-flight.
+
+        Returns None when the Run was not paused or redirected, so a
+        normal tunnel close keeps its own status and outcome.
+        """
+        with self._lock:
+            if trace_id in self._paused:
+                return ("paused", self._paused[trace_id]["reason"])
+            if trace_id in self._redirects:
+                return ("redirected", self._redirects[trace_id]["reason"])
+            return None
+
+    def redirect_run(self, trace_id: str, new_dest: str,
+                     reason: str = "human redirect") -> bool:
+        """Move one Run to a new allowlisted destination. Journal first.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route, so proxied agent traffic cannot call it. The new
+        destination must be allowlisted loopback: anything else is
+        refused and journaled (outcome blocked, reason "redirect refused:
+        not allowlisted"), and the Run stays exactly where it was.
+        On success the state save plus journal commit (outcome
+        redirected, status unknown: Unverified explicitly) happen first,
+        then the Run's live tunnel is cut and later traffic for this
+        trace_id goes to the new destination. Other Runs keep their
+        routes. A new redirect needs a fresh Verify before any retry.
+        """
+        if reason not in ("human redirect", "Steer redirect"):
+            return False
+        try:
+            new_host, new_port = _split_authority(new_dest, 443)
+            new_label = _format_label(new_host, new_port)
+        except ValueError:
+            new_host, new_port, new_label = None, None, ""
+        if not new_label or not self.is_allowed(new_host, new_port):
+            last = db_module.last_attempt(self.conn, trace_id)
+            dest_host = last["dest_host"] if last else ""
+            endpoint = last["endpoint"] if last else ""
+            method = last["method"] if last else ""
+            self._control_row(trace_id, method, dest_host, endpoint,
+                              "unknown", "blocked",
+                              "redirect refused: not allowlisted",
+                              "redirected")
+            return False
+        last = db_module.last_attempt(self.conn, trace_id)
+        method = last["method"] if last else ""
+        endpoint = last["endpoint"] if last else ""
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.save_redirected(self.conn, trace_id, new_label,
+                                  reason, now)
+        self._control_row(trace_id, method, new_label, new_label,
+                          "unknown", "redirected", reason, "redirected")
+        with self._lock:
+            self._redirects[trace_id] = {"dest_host": new_label,
+                                         "reason": reason,
+                                         "created_at": now}
+            self._verified.pop(trace_id, None)
+            live = self._live.pop(trace_id, set())
+        for sock in live:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return True
+
+    def _control_row(self, trace_id: str, method: str, dest_host: str,
+                     endpoint: str, status: str, outcome: str,
+                     reason: str, close_reason: str) -> None:
+        """One journal row for a Steer control action. Metadata only.
+
+        No bodies, no keys, no hostnames beyond the loopback destination
+        label already on the Run's own rows. Cost is always $0.00.
+        """
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        task_number = self.task_number(trace_id, None)
+        attempt = self.peek_attempt(trace_id, endpoint, method)
+        db_module.log_attempt(
+            self.conn, trace_id=trace_id,
+            task_number=task_number, attempt=attempt,
+            strategy="proxy", status=status,
+            latency_seconds=0.0,
+            retry_reason=_retry_reason(attempt),
+            dest_host=dest_host, endpoint=endpoint,
+            method=method, bytes_in=0, bytes_out=0,
+            http_status=None, created_at=now,
+            outcome=outcome, reason=reason,
+            close_reason=close_reason)
+
+    def pause_run(self, trace_id: str,
+                  reason: str = "human pause") -> bool:
+        """Pause one Run by trace_id. Journal first, then cut.
+
+        Writes the paused state and the pause row (outcome paused,
+        status unknown: Unverified, explicitly, never Correct and never
+        Incorrect from a pause alone), and only then shuts the Run's
+        live tunnel sockets. Other Runs keep their tunnels. A new pause
+        needs a fresh Verify before any retry. Idempotent: pausing a
+        paused Run returns True without a duplicate row.
+        """
+        if reason not in ("human pause", "Steer pause"):
+            return False
+        if self.is_paused(trace_id):
+            return True
+        last = db_module.last_attempt(self.conn, trace_id)
+        dest_host = last["dest_host"] if last else ""
+        endpoint = last["endpoint"] if last else ""
+        method = last["method"] if last else ""
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.save_paused(self.conn, trace_id, reason, now)
+        self._control_row(trace_id, method, dest_host, endpoint,
+                          "unknown", "paused", reason, "paused")
+        with self._lock:
+            self._paused[trace_id] = {"reason": reason, "created_at": now}
+            self._verified.pop(trace_id, None)
+            live = self._live.pop(trace_id, set())
+        for sock in live:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return True
+
+    def verify_run(self, trace_id: str, done_clause=None) -> bool:
+        """Record a fresh human Verify for a paused or redirected Run.
+
+        Refuses (False, no row) when the Run is neither paused nor
+        redirected, when the done clause is missing or not
+        human-approved, or when the journal read finds nothing to
+        verify. Otherwise journals the Verify and stamps it: only a
+        Verify after the pause or redirect unblocks a retry.
+        """
+        with self._lock:
+            gated = (trace_id in self._paused
+                     or trace_id in self._redirects)
+        if not gated:
+            return False
+        if (not isinstance(done_clause, dict)
+                or done_clause.get("approved_by") != "human"
+                or not done_clause.get("read_back")):
+            return False
+        last = db_module.last_attempt(self.conn, trace_id)
+        if last is None:
+            return False
+        self._control_row(trace_id, "VERIFY", last["dest_host"],
+                          last["endpoint"], "unknown", "", "verify ok",
+                          "paused")
+        with self._lock:
+            self._verified[trace_id] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat(timespec="seconds")
+        return True
+
+    def retry_run(self, trace_id: str) -> tuple:
+        """Retry gate for a paused or redirected Run: blocked until fresh.
+
+        Returns (allowed, reason). A blocked retry is journaled with
+        reason "verify required before retry". An allowed retry (fresh
+        Verify after the pause or redirect) resumes the Run and journals
+        that. A pause is forgotten on resume; a redirect stays on its
+        human-chosen destination, and the Verify stamp stays with it so
+        later retries on that destination keep working until the next
+        redirect. A Run that is neither paused nor redirected is not
+        gated here: (True, "not paused"), no row.
+        """
+        with self._lock:
+            if trace_id in self._paused:
+                kind, since = "paused", self._paused[trace_id]["created_at"]
+            elif trace_id in self._redirects:
+                kind = "redirected"
+                since = self._redirects[trace_id]["created_at"]
+            else:
+                return True, "not paused"
+            verified_at = self._verified.get(trace_id)
+        last = db_module.last_attempt(self.conn, trace_id)
+        dest_host = last["dest_host"] if last else ""
+        endpoint = last["endpoint"] if last else ""
+        # The stamp can only exist when a Verify landed after this
+        # pause or redirect (a new one clears it), so presence means
+        # fresh. The timestamp check is a backstop, same-second stamps
+        # included.
+        if not verified_at or verified_at < since:
+            self._control_row(trace_id, "RETRY", dest_host, endpoint,
+                              "unknown", "blocked",
+                              "verify required before retry", kind)
+            return False, "verify required before retry"
+        if kind == "paused":
+            db_module.clear_paused(self.conn, trace_id)
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        self._control_row(trace_id, "RETRY", dest_host, endpoint,
+                          "unknown", "", "retry allowed after verify",
+                          kind)
+        with self._lock:
+            if kind == "paused":
+                self._paused.pop(trace_id, None)
+                self._verified.pop(trace_id, None)
+            else:
+                self._verified[trace_id] = now
+        return True, "retry allowed after verify"
+
+    def _register_live(self, trace_id: str, sock) -> None:
+        """Track one open tunnel socket under its Run, for Pause cuts."""
+        with self._lock:
+            self._live.setdefault(trace_id, set()).add(sock)
+
+    def _unregister_live(self, trace_id: str, sock) -> None:
+        """Forget a closed tunnel socket. Never raises."""
+        with self._lock:
+            live = self._live.get(trace_id)
+            if live is not None:
+                live.discard(sock)
+                if not live:
+                    self._live.pop(trace_id, None)
 
 
 class _RelayTimeout(Exception):
@@ -418,11 +685,34 @@ def make_handler(state: ProxyState):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            target = state.redirect_target(trace_id)
+            if target is not None:
+                # Redirected Run: this tunnel goes to the human-chosen
+                # destination instead of the requested one. The target
+                # was allowlisted at redirect time.
+                try:
+                    new_host, new_port = _split_authority(target, 443)
+                except ValueError:
+                    pass  # validated at redirect time; keep requested
+                else:
+                    dest_host, dest_port = new_host, new_port
+                    endpoint = target
             if not state.check_rate(endpoint):
                 attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
                 log_connect("rate_limited", "rate_limited", "rate_limited",
                             429, 0, 0, "rate_limited")
                 self.send_response(429)
+                self.send_header("X-Trace-Id", trace_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if state.is_paused(trace_id):
+                # Paused Run: no new tunnel. Unknown, never Correct.
+                attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
+                log_connect("unknown", "paused",
+                            state.pause_reason(trace_id),
+                            503, 0, 0, "paused")
+                self.send_response(503)
                 self.send_header("X-Trace-Id", trace_id)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -451,6 +741,7 @@ def make_handler(state: ProxyState):
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
+            state._register_live(trace_id, self.connection)
             status, bytes_in, bytes_out, close_reason = "success", 0, 0, "success"
             try:
                 bytes_in, bytes_out, close_reason = _relay(
@@ -469,9 +760,20 @@ def make_handler(state: ProxyState):
                 status = "failure"
                 close_reason = "unknown"
             finally:
+                state._unregister_live(trace_id, self.connection)
                 upstream.close()
-            log_connect(status, "allowed", "", None, bytes_in, bytes_out,
-                        close_reason, connect_ms)
+            cut = state.steer_cut(trace_id)
+            if cut is not None and status != "success":
+                # Cut mid-flight by Pause or Redirect: the tunnel did not
+                # fail, it was steered, so the outcome is unknown, never
+                # failure. The reason stays the steer reason, for one
+                # plain story.
+                status = "unknown"
+                log_connect(status, cut[0], cut[1], None,
+                            bytes_in, bytes_out, close_reason, connect_ms)
+            else:
+                log_connect(status, "allowed", "", None, bytes_in, bytes_out,
+                            close_reason, connect_ms)
 
         def _target(self):
             """Return (host, port, endpoint), None if unsupported.
@@ -517,8 +819,14 @@ def make_handler(state: ProxyState):
             super().send_error(code, message, explain)
 
         def _refused(self, code, status, reason, dest_host, endpoint,
-                     body, trace_id=None, close_reason="unknown"):
-            """Refuse a request with a plain-words body plus an audit row."""
+                     body, trace_id=None, close_reason="unknown",
+                     outcome=None):
+            """Refuse a request with a plain-words body plus an audit row.
+
+            Outcome defaults to the status (blocked, rate_limited,
+            failure); Pause passes its own outcome so a paused refusal
+            reconciles under paused instead of failure.
+            """
             if trace_id is None:
                 trace_id = self.headers.get("X-Trace-Id") or str(uuid.uuid4())
             task_number = state.task_number(
@@ -540,7 +848,9 @@ def make_handler(state: ProxyState):
                 dest_host=dest_host, endpoint=endpoint,
                 method=getattr(self, "command", ""),
                 bytes_in=0, bytes_out=0,
-                http_status=code, outcome=status, reason=reason,
+                http_status=code,
+                outcome=outcome if outcome is not None else status,
+                reason=reason,
                 close_reason=close_reason, duration_ms=duration_ms)
             self.send_response(code)
             self.send_header("Content-Type", "text/plain")
@@ -696,9 +1006,32 @@ def make_handler(state: ProxyState):
                 reject(403, "blocked", "not_allowlisted",
                        close_reason="blocked_allowlist")
                 return
+            target = state.redirect_target(trace_id)
+            if target is not None:
+                # Redirected Run: this request goes to the human-chosen
+                # destination instead of the requested one. The target
+                # was allowlisted at redirect time. The path stays.
+                try:
+                    new_host, new_port = _split_authority(target, 80)
+                except ValueError:
+                    pass  # validated at redirect time; keep requested
+                else:
+                    dest_host, dest_port = new_host, new_port
+                    dest_label = target
             if not state.check_rate(dest_label):
                 reject(429, "rate_limited", "rate_limited",
                        close_reason="rate_limited")
+                return
+            if state.is_paused(trace_id):
+                # Paused Run: nothing forwards for it. Unknown, never
+                # Correct, and reconciled under paused, not failure.
+                self._refused(
+                    503, "unknown", state.pause_reason(trace_id),
+                    dest_label, endpoint,
+                    b"paused: this Run is paused, "
+                    b"retry needs a fresh Verify\n",
+                    trace_id=trace_id, close_reason="paused",
+                    outcome="paused")
                 return
 
             # Request smuggling hygiene: one length, one framing, never both.

@@ -73,6 +73,8 @@ def main():
         rate = (100.0 * successes / attempts) if attempts else 0.0
         print(f"allowed={outcomes['allowed']} blocked={outcomes['blocked']} "
               f"rate_limited={outcomes['rate_limited']} "
+              f"paused={outcomes['paused']} "
+              f"redirected={outcomes['redirected']} "
               f"other={outcomes['other']}")
         print(f"attempts={attempts} traces={totals['traces'] or 0} "
               f"successes={successes} success_rate={rate:.1f}% "
@@ -83,7 +85,8 @@ def main():
         # The first /echo call also counts toward the same
         # destination window, so the burst forwards 4, not 5.
         assert outcomes == {"allowed": 6, "blocked": 1,
-                            "rate_limited": 3, "other": 0}
+                            "rate_limited": 3, "paused": 0,
+                            "redirected": 0, "other": 0}
         print("PASS: allowed forwarded, exfil blocked at proxy, "
               "burst excess rate_limited, recovery after pause")
     finally:

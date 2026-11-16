@@ -26,6 +26,8 @@ def main():
     outcomes = db_module.fetch_outcome_counts(conn)
     print(f"allowed={outcomes['allowed']} blocked={outcomes['blocked']} "
           f"rate_limited={outcomes['rate_limited']} "
+          f"paused={outcomes['paused']} "
+          f"redirected={outcomes['redirected']} "
           f"other={outcomes['other']}")
     print(f"attempts={attempts} traces={totals['traces'] or 0} "
           f"successes={successes} success_rate={rate:.1f}% "

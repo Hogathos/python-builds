@@ -61,6 +61,9 @@ def init_db(path: str) -> sqlite3.Connection:
     """Open (or create) the database at path and ensure the table exists."""
     conn = sqlite3.connect(path, check_same_thread=False)  # proxy logs from worker threads
     conn.execute(CREATE_TABLE_SQL)
+    conn.execute(PAUSED_RUNS_TABLE_SQL)
+    conn.execute(REDIRECTED_RUNS_TABLE_SQL)
+    conn.commit()
     # M4 migration: add outcome/reason to a pre-M4 database in place.
     # Two processes can arrive here together; if a peer wins the race
     # the ALTER fails duplicate-column and the re-check below lets us
@@ -208,17 +211,131 @@ def fetch_report(conn):
 
 
 def fetch_outcome_counts(conn) -> dict:
-    """M4 counts: allowed, blocked, rate_limited, plus other.
+    """M4 counts plus Steer paused: allowed, blocked, rate_limited,
+    paused, plus other.
 
     "other" catches NULL, empty, or legacy outcomes from a migrated
-    pre-M4 database, so the four counts always add up to total
+    pre-M4 database, so the five counts always add up to total
     attempts instead of silently dropping rows.
     """
-    counts = {"allowed": 0, "blocked": 0, "rate_limited": 0, "other": 0}
+    counts = {"allowed": 0, "blocked": 0, "rate_limited": 0,
+              "paused": 0, "redirected": 0, "other": 0}
     for outcome, n in conn.execute(
             "SELECT outcome, COUNT(*) FROM attempts GROUP BY outcome"):
-        if outcome in ("allowed", "blocked", "rate_limited"):
+        if outcome in ("allowed", "blocked", "rate_limited",
+                       "paused", "redirected"):
             counts[outcome] = n
         else:
             counts["other"] += n
     return counts
+
+
+PAUSED_RUNS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS paused_runs (
+    trace_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def load_paused(conn) -> dict:
+    """Paused Runs that survive an Iris restart: never auto-resume.
+
+    Returns {trace_id: {"reason": ..., "created_at": ...}}. A restart
+    loads this back, so a paused Run stays paused until a human
+    resumes it (a fresh Verify, then a retry), never on a timer.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        return {
+            row["trace_id"]: {"reason": row["reason"],
+                              "created_at": row["created_at"]}
+            for row in conn.execute(
+                "SELECT trace_id, reason, created_at FROM paused_runs")
+        }
+    finally:
+        conn.row_factory = prev_factory
+
+
+def save_paused(conn, trace_id: str, reason: str, created_at: str) -> None:
+    """Record one paused Run. Human-only callers; never the agent."""
+    with _write_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO paused_runs "
+            "(trace_id, reason, created_at) VALUES (?, ?, ?)",
+            (trace_id, reason, created_at),
+        )
+        conn.commit()
+
+
+def clear_paused(conn, trace_id: str) -> None:
+    """Forget one paused Run: it resumed after a fresh Verify."""
+    with _write_lock:
+        conn.execute("DELETE FROM paused_runs WHERE trace_id = ?",
+                     (trace_id,))
+        conn.commit()
+
+
+REDIRECTED_RUNS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS redirected_runs (
+    trace_id TEXT PRIMARY KEY,
+    dest_host TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def load_redirected(conn) -> dict:
+    """Redirected Runs that survive an Iris restart: never silently undo.
+
+    Returns {trace_id: {"dest_host": ..., "reason": ..., "created_at": ...}}.
+    A restart loads this back, so a redirected Run stays on its human-chosen
+    destination instead of failing open to the old one.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        return {
+            row["trace_id"]: {"dest_host": row["dest_host"],
+                              "reason": row["reason"],
+                              "created_at": row["created_at"]}
+            for row in conn.execute(
+                "SELECT trace_id, dest_host, reason, created_at"
+                " FROM redirected_runs")
+        }
+    finally:
+        conn.row_factory = prev_factory
+
+
+def save_redirected(conn, trace_id: str, dest_host: str, reason: str,
+                    created_at: str) -> None:
+    """Record one redirected Run. Human-only callers; never the agent."""
+    with _write_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO redirected_runs "
+            "(trace_id, dest_host, reason, created_at) VALUES (?, ?, ?, ?)",
+            (trace_id, dest_host, reason, created_at),
+        )
+        conn.commit()
+
+
+def last_attempt(conn, trace_id: str):
+    """Newest journal row for one trace, or None when there is none.
+
+    A read that can fail: Verify uses it, and a trace with no rows
+    cannot be verified, so verify_run refuses instead of guessing.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM attempts WHERE trace_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (trace_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.row_factory = prev_factory
