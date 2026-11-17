@@ -276,6 +276,11 @@ class ProxyState:
         self._stopped_traces: set = db_module.load_red_button_traces(
             self.conn)
         self._approved: dict[str, str] = {}
+        # Steer per-network override: rule per destination, human-only,
+        # journal first, fail-closed. Survives restart, never silently
+        # lifted, same as every other Steer control.
+        self._overrides: dict[str, dict] = db_module.load_overrides(
+            self.conn)
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
         self._attempts: dict[tuple[str, str, str], list[float]] = {}
@@ -448,6 +453,80 @@ class ProxyState:
                 pass
         return True
 
+    def override_rule(self, dest_label: str):
+        """Override rule for one destination, or None when there is none.
+
+        Rules are keyed by the full destination, host plus port: a rule
+        for 127.0.0.1:9001 never touches 127.0.0.1:9002.
+        """
+        with self._lock:
+            return self._overrides.get(dest_label)
+
+    def set_override(self, dest_label: str, action: str = "pause",
+                     reason: str = "human override", target: str = "") -> bool:
+        """Set a human override for one network. Journal first.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route, so proxied agent traffic cannot call it. Only the
+        pause action is built; allow, block, and redirect are named for
+        later tests and refused here. The destination must parse and be
+        allowlisted: anything else is refused and journaled (outcome
+        blocked, reason "non-allowlisted override name", dest = the name
+        as given), and nothing is cut. On success the rule save plus the
+        pause journal rows commit first, then every live tunnel on that
+        network is cut, and later traffic for it is refused. Other
+        networks keep flowing. Retries need a fresh Verify, through the
+        existing gate.
+        """
+        if reason not in ("human override", "Steer override"):
+            return False
+        if action != "pause":
+            return False
+        try:
+            host, port = _split_authority(dest_label, 443)
+            label = _format_label(host, port)
+        except ValueError:
+            host, port, label = None, None, ""
+        if not label or not self.is_allowed(host, port):
+            # The refusal names a destination, not a Run: no Run existed,
+            # none is invented. It journals under its own override-attempt
+            # trace so the audit trail has exactly one row for it and no
+            # Run's history is touched.
+            attempt_trace = f"override::{dest_label}"
+            self._control_row(attempt_trace, "", dest_label, dest_label,
+                              "unknown", "blocked",
+                              "non-allowlisted override name",
+                              "overridden")
+            return False
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.save_override(self.conn, label, action, target,
+                                reason, now)
+        with self._lock:
+            self._overrides[label] = {"action": action, "target": target,
+                                      "reason": reason, "created_at": now}
+            live_traces = [tid for tid, socks in self._live.items()
+                           if any(d == label for d in socks.values())]
+        for trace_id in live_traces:
+            last = db_module.last_attempt(self.conn, trace_id)
+            method = last["method"] if last else ""
+            db_module.save_paused(self.conn, trace_id, reason, now)
+            self._control_row(trace_id, method, label, label,
+                              "unknown", "paused", reason, "paused")
+            with self._lock:
+                self._paused[trace_id] = {"reason": reason,
+                                          "created_at": now}
+                self._verified.pop(trace_id, None)
+        with self._lock:
+            live = [sock for tid in live_traces
+                    for sock in self._live.pop(tid, {}).keys()]
+        for sock in live:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return True
+
     def _control_row(self, trace_id: str, method: str, dest_host: str,
                      endpoint: str, status: str, outcome: str,
                      reason: str, close_reason: str) -> None:
@@ -545,9 +624,20 @@ class ProxyState:
         with self._lock:
             self._stopped_traces.update(traces)
         for trace_id in traces:
+            # Live first, journaled second, never empty for a live
+            # tunnel: an open tunnel has no journal row yet. Same union
+            # rule as Pause, fix 54498fc.
+            with self._lock:
+                live_here = self._live.get(trace_id, {})
+                live_dests = [d for d in live_here.values() if d]
             last = db_module.last_attempt(self.conn, trace_id)
-            dest_host = last["dest_host"] if last else ""
-            endpoint = last["endpoint"] if last else ""
+            if live_dests:
+                dest_host = endpoint = live_dests[0]
+            elif last:
+                dest_host = last["dest_host"]
+                endpoint = last["endpoint"]
+            else:
+                dest_host = endpoint = ""
             method = last["method"] if last else ""
             self._control_row(trace_id, method, dest_host, endpoint,
                               "unknown", "stopped", reason, "stopped")
@@ -981,6 +1071,18 @@ def make_handler(state: ProxyState):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            rule = state.override_rule(endpoint)
+            if rule is not None and rule["action"] == "pause":
+                # Overridden network: no new tunnel. Unknown, never
+                # Correct. Journaled under paused, like a Run pause.
+                attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
+                log_connect("unknown", "paused", rule["reason"],
+                            503, 0, 0, "paused")
+                self.send_response(503)
+                self.send_header("X-Trace-Id", trace_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
             # Numbered only once the tunnel will actually be opened.
             attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
@@ -1000,12 +1102,16 @@ def make_handler(state: ProxyState):
                 self.end_headers()
                 return
 
+            # Register before answering: by the time the client sees the
+            # 200, the tunnel is tracked, so a Steer action landing in
+            # between journals the live destination, never '', and cuts
+            # a live socket, never nothing.
+            state._register_live(trace_id, self.connection, endpoint)
             self.send_response(200)
             self.send_header("X-Trace-Id", trace_id)
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            state._register_live(trace_id, self.connection, endpoint)
             status, bytes_in, bytes_out, close_reason = "success", 0, 0, "success"
             try:
                 bytes_in, bytes_out, close_reason = _relay(
@@ -1305,6 +1411,18 @@ def make_handler(state: ProxyState):
                     503, "unknown", state.pause_reason(trace_id),
                     dest_label, endpoint,
                     b"paused: this Run is paused, "
+                    b"retry needs a fresh Verify\n",
+                    trace_id=trace_id, close_reason="paused",
+                    outcome="paused")
+                return
+            rule = state.override_rule(dest_label)
+            if rule is not None and rule["action"] == "pause":
+                # Overridden network: nothing forwards for it. Unknown,
+                # never Correct, and reconciled under paused, not failure.
+                self._refused(
+                    503, "unknown", rule["reason"],
+                    dest_label, endpoint,
+                    b"paused: this network is paused by human override, "
                     b"retry needs a fresh Verify\n",
                     trace_id=trace_id, close_reason="paused",
                     outcome="paused")

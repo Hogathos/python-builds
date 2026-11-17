@@ -319,5 +319,123 @@ class SteerRedButtonTest(unittest.TestCase):
             sock2.close()
 
 
+class RedButtonLiveOnlyTraceTest(unittest.TestCase):
+    """Gap 13: a live-only trace gets a stop row naming its destination.
+
+    A Run with an open tunnel but no journal row yet is still a known
+    Run. Red button must stop it with dest_host = the full live
+    destination, never ''. Test-first: this fails until red_button
+    takes destinations live first, journaled second, like pause fix
+    54498fc. Do NOT fix Pause, Redirect, or Verify in that change.
+    """
+
+    def setUp(self):
+        """Fresh proxy, fresh temp DB, one loopback destination."""
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "attempts.db")
+        self.echo = socketserver.ThreadingTCPServer(
+            ("127.0.0.1", 0), _CountingEchoHandler)
+        self.echo.count = 0
+        threading.Thread(target=self.echo.serve_forever, daemon=True).start()
+        self.proxy = proxy_module.serve("127.0.0.1", 0, self.db_path)
+        self.proxy_port = self.proxy.server_address[1]
+        threading.Thread(
+            target=self.proxy.serve_forever, daemon=True).start()
+        # addCleanup runs LIFO: shutdowns are added last so they run
+        # first then closes, then DB, then temp. Closing a listening
+        # socket while serve_forever still selects on it crashes
+        # Windows; shutdown first, always.
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.proxy.state.conn.close)
+        self.addCleanup(self.echo.server_close)
+        self.addCleanup(self.proxy.server_close)
+        self.addCleanup(self.echo.shutdown)
+        self.addCleanup(self.proxy.shutdown)
+        self.dest = f"127.0.0.1:{self.echo.server_address[1]}"
+
+    def rows_for(self, trace_id):
+        """All journal rows for one trace_id, oldest first. Read only."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            return conn.execute(
+                "SELECT * FROM attempts WHERE trace_id = ? ORDER BY id",
+                (trace_id,)).fetchall()
+        finally:
+            conn.close()
+
+    def test_red_button_live_only_trace_names_destination(self):
+        """Stop row names the live destination, tunnel dead, no fail-open."""
+        # Step 1: Run starts, live tunnel flowing, no journal row yet,
+        # no round trip. The 200 response is the only proof so far.
+        trace = "redbutton-live-only-1"
+        sock = socket.create_connection(
+            ("127.0.0.1", self.proxy_port), timeout=5)
+        sock.settimeout(5)
+        try:
+            sock.sendall(
+                (f"CONNECT {self.dest} HTTP/1.1\r\nHost: {self.dest}\r\n"
+                 f"X-Trace-Id: {trace}\r\n\r\n").encode())
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = sock.recv(65536)
+                self.assertTrue(chunk)
+                raw += chunk
+            head = raw.split(b"\r\n\r\n", 1)[0].decode(errors="replace")
+            self.assertEqual(int(head.split()[1]), 200)
+            self.assertEqual(
+                [r for r in self.rows_for(trace)], [],
+                "no journal row yet for the live-only trace")
+
+            # Step 2: human presses Red button, human-only, journal first.
+            self.assertTrue(
+                self.proxy.state.red_button(reason="human red button"))
+
+            # Step 3: stop row dest_host = full live destination, never
+            # '', outcome stopped, status unknown, Unverified explicitly,
+            # reason human red button.
+            stop_rows = [
+                r for r in self.rows_for(trace)
+                if r["outcome"] == "stopped"
+            ]
+            self.assertTrue(stop_rows, "live-only trace needs a stop row")
+            stop_row = stop_rows[-1]
+            self.assertEqual(stop_row["dest_host"], self.dest)
+            self.assertEqual(stop_row["reason"], "human red button")
+            self.assertEqual(
+                stop_row["status"], "unknown",
+                "stop verdict must be Unverified, explicitly")
+
+            # Step 4: live tunnel dead, new tunnels refused, approval
+            # plus Verify needed to move again.
+            try:
+                sock.sendall(b"ping-after-stop")
+                data = sock.recv(65536)
+                self.assertEqual(data, b"", "stopped tunnel still flows")
+            except OSError:
+                pass
+            sock2 = socket.create_connection(
+                ("127.0.0.1", self.proxy_port), timeout=5)
+            try:
+                sock2.settimeout(5)
+                sock2.sendall(
+                    (f"CONNECT {self.dest} HTTP/1.1\r\nHost: {self.dest}\r\n"
+                     f"X-Trace-Id: {trace}\r\n\r\n").encode())
+                raw = b""
+                while b"\r\n\r\n" not in raw:
+                    chunk = sock2.recv(65536)
+                    self.assertTrue(chunk)
+                    raw += chunk
+                head = raw.split(b"\r\n\r\n", 1)[0].decode(errors="replace")
+                self.assertEqual(
+                    int(head.split()[1]), 503, "stopped Run stays stopped")
+            finally:
+                sock2.close()
+            allowed, _ = self.proxy.state.retry_run(trace)
+            self.assertFalse(allowed, "retry needs fresh approval + Verify")
+        finally:
+            sock.close()
+
+
 if __name__ == "__main__":
     unittest.main()
