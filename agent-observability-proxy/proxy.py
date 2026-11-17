@@ -1000,12 +1000,15 @@ def make_handler(state: ProxyState):
                 self.end_headers()
                 return
 
+            # Register before answering: by the time the client sees the
+            # 200, the tunnel is tracked, so a Pause that lands in between
+            # journals the live destination and cuts a live socket.
+            state._register_live(trace_id, self.connection, endpoint)
             self.send_response(200)
             self.send_header("X-Trace-Id", trace_id)
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            state._register_live(trace_id, self.connection, endpoint)
             status, bytes_in, bytes_out, close_reason = "success", 0, 0, "success"
             try:
                 bytes_in, bytes_out, close_reason = _relay(
