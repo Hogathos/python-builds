@@ -281,6 +281,12 @@ class ProxyState:
         # lifted, same as every other Steer control.
         self._overrides: dict[str, dict] = db_module.load_overrides(
             self.conn)
+        # Steer spend caps: per-network dollar caps, human-only, journal
+        # first. Survives restart, never silently lifted. Warned flags
+        # and pause-by-cap traces live here; the rules live in SQLite.
+        self._caps: dict[str, dict] = db_module.load_caps(self.conn)
+        self._cap_warned: set = set()
+        self._cap_paused: dict[str, str] = {}
         self._task_by_trace: dict[str, int] = {}
         self._next_task = 1
         self._attempts: dict[tuple[str, str, str], list[float]] = {}
@@ -453,6 +459,140 @@ class ProxyState:
                 pass
         return True
 
+    def cap_rule(self, dest_label: str):
+        """Spend-cap rule for one network, or None when there is none.
+
+        Rules are keyed by the full destination, host plus port: a cap
+        on 127.0.0.1:9001 never touches 127.0.0.1:9002.
+        """
+        with self._lock:
+            return self._caps.get(dest_label)
+
+    def capped_total(self, dest_label: str) -> float:
+        """Recorded priced spend for one network. Unverified excluded.
+
+        Sums attempt_cost over allowed rows only: control rows cost
+        nothing, and rows with no priced cost (Unverified, never
+        guessed) contribute nothing. Rounded to cents: this is money.
+        """
+        from api import attempt_cost
+        total = 0.0
+        for outcome, dest_host, cost in self.conn.execute(
+                "SELECT outcome, dest_host, cost_dollars FROM attempts"
+                " WHERE dest_host = ? AND outcome = 'allowed'",
+                (dest_label,)):
+            priced = attempt_cost({"outcome": outcome,
+                                   "dest_host": dest_host,
+                                   "cost_dollars": cost,
+                                   "status": "success"})
+            if priced is not None:
+                total += priced
+        return round(total, 2)
+
+    def set_cap(self, dest_label: str, cap, reason: str = "human cap") -> bool:
+        """Set a spend cap in dollars for one network. Journal first.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route, so proxied agent traffic cannot set one. The
+        destination must parse and be allowlisted, and the cap must be
+        a positive number; anything else is refused with no row. On
+        success the rule save plus journal row commit first (outcome
+        empty, reason "cap set $X.XX"). Later traffic for the network
+        warns at 80% and blocks at 100%, both journaled.
+        """
+        if reason not in ("human cap", "Steer cap"):
+            return False
+        try:
+            host, port = _split_authority(dest_label, 443)
+            label = _format_label(host, port)
+        except ValueError:
+            return False
+        try:
+            amount = float(cap)
+        except (TypeError, ValueError):
+            return False
+        if not amount > 0 or not self.is_allowed(host, port):
+            return False
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.save_cap(self.conn, label, amount, reason, now)
+        with self._lock:
+            self._caps[label] = {"cap": amount, "reason": reason,
+                                 "created_at": now}
+            self._cap_warned.discard(label)
+        self._control_row("", "CAP", label, label,
+                          "unknown", "", f"cap set ${amount:.2f}", "capped")
+        return True
+
+    def unblock_cap(self, dest_label: str,
+                    reason: str = "human unblock") -> bool:
+        """Lift a spend cap after Verify. Human-only, journaled.
+
+        Human-only: a plain method on the local proxy state, never an
+        HTTP route. Refuses (False, no row) when there is no cap or the
+        reason is not human. Otherwise journals the lift, forgets the
+        rule, and unpauses the Runs the cap had stopped. Later Runs
+        start clean; old pause rows stay in the journal.
+        """
+        if reason not in ("human unblock", "Steer unblock"):
+            return False
+        with self._lock:
+            if dest_label not in self._caps:
+                return False
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        db_module.clear_cap(self.conn, dest_label)
+        with self._lock:
+            self._caps.pop(dest_label, None)
+            self._cap_warned.discard(dest_label)
+        self._control_row("", "CAP", dest_label, dest_label,
+                          "unknown", "", "cap lifted", "capped")
+        with self._lock:
+            stopped = [tid for tid, dest in self._cap_paused.items()
+                       if dest == dest_label]
+        for trace_id in stopped:
+            db_module.clear_paused(self.conn, trace_id)
+            with self._lock:
+                self._paused.pop(trace_id, None)
+                self._verified.pop(trace_id, None)
+                self._cap_paused.pop(trace_id, None)
+        return True
+
+    def _cap_block(self, dest_label: str) -> None:
+        """Journal-then-cut for a network at its cap. Human set it up;
+        this is the enforcement half, and it journals every step.
+
+        Every live tunnel on the network gets a pause row first, then
+        the sockets shut. Retries stay blocked until a fresh Verify,
+        through the existing gate.
+        """
+        now = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            live = {tid: dict(socks) for tid, socks in self._live.items()
+                    if any(d == dest_label for d in socks.values())}
+        for trace_id in live:
+            last = db_module.last_attempt(self.conn, trace_id)
+            method = last["method"] if last else ""
+            db_module.save_paused(self.conn, trace_id,
+                                  "cap block 100%", now)
+            self._control_row(trace_id, method, dest_label, dest_label,
+                              "unknown", "paused", "cap block 100%",
+                              "capped")
+            with self._lock:
+                self._paused[trace_id] = {"reason": "cap block 100%",
+                                          "created_at": now}
+                self._verified.pop(trace_id, None)
+                self._cap_paused[trace_id] = dest_label
+        with self._lock:
+            socks = [sock for tid in live
+                     for sock in self._live.pop(tid, {}).keys()]
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def override_rule(self, dest_label: str):
         """Override rule for one destination, or None when there is none.
 
@@ -529,11 +669,14 @@ class ProxyState:
 
     def _control_row(self, trace_id: str, method: str, dest_host: str,
                      endpoint: str, status: str, outcome: str,
-                     reason: str, close_reason: str) -> None:
+                     reason: str, close_reason: str,
+                     cost_dollars: float = 0.0) -> None:
         """One journal row for a Steer control action. Metadata only.
 
         No bodies, no keys, no hostnames beyond the loopback destination
-        label already on the Run's own rows. Cost is always $0.00.
+        label already on the Run's own rows. Cost is $0.00, except a
+        spend-cap warn row, which carries the cumulative total that
+        tripped it: saying what was spent is the warning.
         """
         now = datetime.datetime.now(
             datetime.timezone.utc).isoformat(timespec="seconds")
@@ -549,6 +692,7 @@ class ProxyState:
             method=method, bytes_in=0, bytes_out=0,
             http_status=None, created_at=now,
             outcome=outcome, reason=reason,
+            cost_dollars=cost_dollars,
             close_reason=close_reason)
 
     def pause_run(self, trace_id: str,
@@ -1083,6 +1227,35 @@ def make_handler(state: ProxyState):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            cap = state.cap_rule(endpoint)
+            if cap is not None:
+                total = state.capped_total(endpoint)
+                if total >= cap["cap"]:
+                    # At the cap: journal the block first, cut live
+                    # tunnels second, then refuse. Unknown, never
+                    # Correct. Retries stay blocked until a fresh Verify.
+                    attempt = state.peek_attempt(trace_id, endpoint, "CONNECT")
+                    log_connect("unknown", "blocked", "cap block 100%",
+                                503, 0, 0, "capped")
+                    state._cap_block(endpoint)
+                    self.send_response(503)
+                    self.send_header("X-Trace-Id", trace_id)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if total >= 0.8 * cap["cap"]:
+                    with state._lock:
+                        fresh = endpoint not in state._cap_warned
+                        if fresh:
+                            state._cap_warned.add(endpoint)
+                    if fresh:
+                        # Warn once per cap: the run continues, the next
+                        # call still flows. The row carries what was
+                        # spent: saying it is the warning.
+                        state._control_row(
+                            trace_id, "CONNECT", endpoint, endpoint,
+                            "unknown", "warned", "cap warn 80%", "warned",
+                            total)
 
             # Numbered only once the tunnel will actually be opened.
             attempt = state.next_attempt(trace_id, endpoint, "CONNECT")
@@ -1426,6 +1599,33 @@ def make_handler(state: ProxyState):
                     trace_id=trace_id, close_reason="paused",
                     outcome="paused")
                 return
+            cap = state.cap_rule(dest_label)
+            if cap is not None:
+                total = state.capped_total(dest_label)
+                if total >= cap["cap"]:
+                    # At the cap: journal the block first, cut live
+                    # tunnels second, then refuse. Unknown, never
+                    # Correct. This run stops unless a human verifies
+                    # everything is fine.
+                    self._refused(
+                        503, "unknown", "cap block 100%",
+                        dest_label, endpoint,
+                        b"blocked: spend cap reached. This run stops unless "
+                        b"a human verifies everything is fine.\n",
+                        trace_id=trace_id, close_reason="capped",
+                        outcome="blocked")
+                    state._cap_block(dest_label)
+                    return
+                if total >= 0.8 * cap["cap"]:
+                    with state._lock:
+                        fresh = dest_label not in state._cap_warned
+                        if fresh:
+                            state._cap_warned.add(dest_label)
+                    if fresh:
+                        state._control_row(
+                            trace_id, self.command, dest_label, endpoint,
+                            "unknown", "warned", "cap warn 80%", "warned",
+                            total)
 
             # Request smuggling hygiene: one length, one framing, never both.
             lengths = [v.strip() for v in

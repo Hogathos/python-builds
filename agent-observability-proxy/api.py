@@ -29,8 +29,9 @@ DB_PATH = os.environ.get(
 # (port stripped before lookup). Loopback is $0.00 because that traffic
 # never leaves the machine: no external API is called, so nothing can be
 # billed. Blocked, rate_limited, paused, redirected, stopped, and
-# verified attempts always cost $0.00: a Verify reads locally and never
-# forwards, so nothing can be billed. A nonzero cost
+# verified attempts always cost $0.00: none of them forward, so nothing
+# can be billed. A warned row carries its cumulative total instead: it
+# reports what was spent, it is not new spend. A nonzero cost
 # already recorded in the database (real API-reported usage) always wins
 # over this table. Any other destination is unknown: no price is guessed.
 # Add a row here only from a published vendor price page, and note the
@@ -189,6 +190,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 <div class="stat">redirected<b id="s-redirected">&ndash;</b><small>moved runs, retry needs a fresh Verify</small></div>
 <div class="stat">stopped<b id="s-stopped">&ndash;</b><small>all stopped, approval needed for a new Run</small></div>
 <div class="stat">verified<b id="s-verified">&ndash;</b><small>checked by read back</small></div>
+<div class="stat">warned<b id="s-warned">&ndash;</b><small>money spent at 80% of cap</small></div>
 <div class="stat">successes<b id="s-success">&ndash;</b><small>completed</small></div>
 <div class="stat">average latency (seconds)<b id="s-lat">&ndash;</b><small>mean wait per try</small></div>
 <div class="stat">total cost<b id="s-cost">&ndash;</b><small>what all runs cost</small></div>
@@ -283,6 +285,7 @@ function outcomeWords(t) {
   if (t.outcome === "verified" && t.status === "success") return "verified Correct";
   if (t.outcome === "verified" && t.status === "failure") return "verified Incorrect";
   if (t.outcome === "verified") return "unverified";
+  if (t.outcome === "warned") return "warned, money spent at 80% of cap";
   if (!t.outcome) return "not recorded";
   if (t.status === "unknown") return "unverified";
   if (t.status === "success") return "allowed";
@@ -323,6 +326,7 @@ async function load() {
     document.getElementById("s-redirected").textContent = s.redirected;
     document.getElementById("s-stopped").textContent = s.stopped;
     document.getElementById("s-verified").textContent = s.verified;
+    document.getElementById("s-warned").textContent = s.warned;
     document.getElementById("s-success").textContent = s.successes;
     document.getElementById("s-lat").textContent = s.avg_latency_seconds;
   document.getElementById("s-cost").textContent = (s.total_cost === null || s.total_cost === undefined) ? "unknown" : "$" + Number(s.total_cost).toFixed(2);
@@ -369,6 +373,8 @@ function closeWords(v) {
   if (v === "redirected") return "redirected";
   if (v === "stopped") return "stopped";
   if (v === "verified") return "verified";
+  if (v === "warned") return "warned";
+  if (v === "capped") return "capped";
   if (v === "relay_timeout") return "tunnel went quiet past the timeout";
   if (v === "success") return "finished";
   return "unknown";
@@ -564,6 +570,7 @@ def stats() -> dict:
             "redirected": 0,
             "stopped": 0,
             "verified": 0,
+            "warned": 0,
             "successes": 0,
             "avg_latency_seconds": 0.0,
         }
@@ -593,6 +600,7 @@ def stats() -> dict:
             "redirected": counts["redirected"],
             "stopped": counts["stopped"],
             "verified": counts["verified"],
+            "warned": counts["warned"],
             "successes": row[0] or 0,
             "avg_latency_seconds": row[1] or 0.0,
             "total_cost": summary["cost"],

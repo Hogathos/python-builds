@@ -66,6 +66,7 @@ def init_db(path: str) -> sqlite3.Connection:
     conn.execute(RED_BUTTON_TABLE_SQL)
     conn.execute(RED_BUTTON_TRACES_TABLE_SQL)
     conn.execute(OVERRIDE_RULES_TABLE_SQL)
+    conn.execute(CAP_RULES_TABLE_SQL)
     conn.commit()
     # M4 migration: add outcome/reason to a pre-M4 database in place.
     # Two processes can arrive here together; if a peer wins the race
@@ -223,11 +224,11 @@ def fetch_outcome_counts(conn) -> dict:
     """
     counts = {"allowed": 0, "blocked": 0, "rate_limited": 0,
               "paused": 0, "redirected": 0, "stopped": 0,
-              "verified": 0, "other": 0}
+              "verified": 0, "warned": 0, "other": 0}
     for outcome, n in conn.execute(
             "SELECT outcome, COUNT(*) FROM attempts GROUP BY outcome"):
         if outcome in ("allowed", "blocked", "rate_limited", "paused",
-                       "redirected", "stopped", "verified"):
+                       "redirected", "stopped", "verified", "warned"):
             counts[outcome] = n
         else:
             counts["other"] += n
@@ -432,6 +433,55 @@ def load_red_button_traces(conn) -> set:
     """Trace ids stopped by the Red button. Never restarted alone."""
     rows = conn.execute("SELECT trace_id FROM red_button_traces").fetchall()
     return {row[0] for row in rows}
+
+
+CAP_RULES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS cap_rules (
+    dest_host TEXT PRIMARY KEY,
+    cap REAL NOT NULL DEFAULT 0.0,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def load_caps(conn) -> dict:
+    """Per-network spend caps that survive a restart: never silently
+    lifted. Returns {dest_host: {"cap": ..., "reason": ...,
+    "created_at": ...}}. A restart loads this back, so a capped network
+    stays capped until a human unblocks it.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        return {
+            row["dest_host"]: {"cap": row["cap"], "reason": row["reason"],
+                               "created_at": row["created_at"]}
+            for row in conn.execute(
+                "SELECT dest_host, cap, reason, created_at FROM cap_rules")
+        }
+    finally:
+        conn.row_factory = prev_factory
+
+
+def save_cap(conn, dest_host: str, cap: float, reason: str,
+             created_at: str) -> None:
+    """Record one spend cap. Human-only; never the agent."""
+    with _write_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO cap_rules "
+            "(dest_host, cap, reason, created_at) VALUES (?, ?, ?, ?)",
+            (dest_host, cap, reason, created_at),
+        )
+        conn.commit()
+
+
+def clear_cap(conn, dest_host: str) -> None:
+    """Forget one spend cap: a human unblocked it after Verify."""
+    with _write_lock:
+        conn.execute("DELETE FROM cap_rules WHERE dest_host = ?",
+                     (dest_host,))
+        conn.commit()
 
 
 def last_attempt(conn, trace_id: str):

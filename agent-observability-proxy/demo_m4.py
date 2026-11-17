@@ -77,6 +77,7 @@ def main():
               f"redirected={outcomes['redirected']} "
               f"stopped={outcomes['stopped']} "
               f"verified={outcomes['verified']} "
+              f"warned={outcomes['warned']} "
               f"other={outcomes['other']}")
         print(f"attempts={attempts} traces={totals['traces'] or 0} "
               f"successes={successes} success_rate={rate:.1f}% "
@@ -89,7 +90,7 @@ def main():
         assert outcomes == {"allowed": 6, "blocked": 1,
                             "rate_limited": 3, "paused": 0,
                             "redirected": 0, "stopped": 0,
-                            "verified": 0, "other": 0}
+                            "verified": 0, "warned": 0, "other": 0}
         print("PASS: allowed forwarded, exfil blocked at proxy, "
               "burst excess rate_limited, recovery after pause")
     finally:
