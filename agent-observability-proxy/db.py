@@ -65,6 +65,7 @@ def init_db(path: str) -> sqlite3.Connection:
     conn.execute(REDIRECTED_RUNS_TABLE_SQL)
     conn.execute(RED_BUTTON_TABLE_SQL)
     conn.execute(RED_BUTTON_TRACES_TABLE_SQL)
+    conn.execute(OVERRIDE_RULES_TABLE_SQL)
     conn.commit()
     # M4 migration: add outcome/reason to a pre-M4 database in place.
     # Two processes can arrive here together; if a peer wins the race
@@ -332,6 +333,52 @@ CREATE TABLE IF NOT EXISTS red_button_state (
     created_at TEXT NOT NULL
 );
 """
+
+
+OVERRIDE_RULES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS override_rules (
+    dest_host TEXT PRIMARY KEY,
+    action TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def load_overrides(conn) -> dict:
+    """Per-network override rules that survive a restart: never silently
+    lifted. Returns {dest_host: {"action": ..., "target": ..., "reason":
+    ..., "created_at": ...}}. A restart loads this back, so an overridden
+    network stays overridden until a human changes it.
+    """
+    prev_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        return {
+            row["dest_host"]: {"action": row["action"],
+                               "target": row["target"],
+                               "reason": row["reason"],
+                               "created_at": row["created_at"]}
+            for row in conn.execute(
+                "SELECT dest_host, action, target, reason, created_at"
+                " FROM override_rules")
+        }
+    finally:
+        conn.row_factory = prev_factory
+
+
+def save_override(conn, dest_host: str, action: str, target: str,
+                  reason: str, created_at: str) -> None:
+    """Record one per-network override rule. Human-only; never the agent."""
+    with _write_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO override_rules "
+            "(dest_host, action, target, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (dest_host, action, target, reason, created_at),
+        )
+        conn.commit()
 
 
 def load_red_button(conn):
