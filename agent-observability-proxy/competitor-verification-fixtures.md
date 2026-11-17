@@ -1,6 +1,6 @@
 # Competitor verification: fixture scripts and configs
 
-Throwaway fixtures from the 2026-11-16 verification run. They live outside the Iris repo. All data is synthetic; key and secret values are replaced with `<PLACEHOLDER-...>` markers.
+Throwaway fixtures from the 2026-11-16 verification run. They now live in the Iris repo at `agent-observability-proxy/competitor-verification-fixtures.md`. All data is synthetic; key and secret values are replaced with `<PLACEHOLDER-...>` markers.
 
 **Setup used** (Python 3.12.3, Node v22.23.4, uv):
 

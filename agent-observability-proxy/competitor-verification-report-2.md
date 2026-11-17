@@ -2,7 +2,7 @@
 
 **Verdict, plain:** none of the four products I could run meets the Iris 7-part criteria. The fifth, Omnitrace, could not be tested. The honest claim stays **"none found in ~20 candidates"**, never "no tool exists".
 
-- **Status:** RUN, NOT PUSHED. Verification only. No Iris code touched, no tests run on Iris, no Lightcone edits, no paid signup, no API key, no real credential, no real destination.
+- **Status:** RUN, PUSHED to branch `reports/competitor-verification-2`, 2026-11-17. Verification only. No Iris code touched, no tests run on Iris, no Lightcone edits, no paid signup, no API key, no real credential, no real destination.
 - **Date:** 2026-11-16 (session date). The sandbox clock ran 2026-11-16T17:54Z to 2026-11-17T04:20Z because the sandbox paused between steps. Candidates 1 and 2 ran about 22:50Z to 22:58Z, tau2-bench about 04:16Z to 04:20Z.
 - **Runner:** Claude in a claude.ai chat sandbox. Linux x86_64, Python 3.12.3, Node v22.23.4. No Docker, firejail, bwrap or nsjail. Network limited to package registries and GitHub.
 - **Input:** `iris-competitor-verification-prompt.md` (filed 2026-11-16) and the run instructions in chat.
