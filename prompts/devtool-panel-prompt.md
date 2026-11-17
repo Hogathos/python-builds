@@ -29,7 +29,7 @@ Build a Wireshark-like panel + 2D swarm map, dev-only, so a human can see tunnel
    - No bodies, no keys, no real hostnames, metadata only.
 2. Pause button, first button only.
    - Pause one Run, journal before cut, human-only, Run 2 still flows, retry without Verify blocked/journaled.
-   - Test-first: failing test first, Charles reviews test, then implement. Pause test 5x, full suite 84 3x.
+   - Test-first: failing test first, Charles reviews test, then implement. Pause test 5x, full suite 92 3x.
 3. Redirect button, second, only after Pause button is tested, pushed, CI green.
 4. Red button, third, only after Redirect.
 5. Verify button, fourth, only after Red button.
